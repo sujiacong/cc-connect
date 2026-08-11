@@ -1403,6 +1403,29 @@ app_secret = "your-feishu-app-secret"
 # bot_secret = "your-bot-secret"
 # allow_from = "*"  # Allowed user IDs / 允许的用户 ID
 
+# Lanxin personal bot (WebSocket long-connection) / 蓝信个人机器人（WebSocket 长连接）
+# 1. Create a personal bot in Lanxin developer console / 在蓝信开发者中心创建个人机器人
+# 2. Get AppID and AppSecret / 获取 AppID 和 AppSecret
+# 3. Fill in config below / 填入下方配置
+# Connection: WebSocket long-connection (client-initiated, no public URL needed)
+# 连接方式：WebSocket 长连接（客户端主动连接，无需公网 URL）
+# NOTE: personal bot mode — private chat only receives messages from the bot creator.
+# Group chat works for all users who @mention the bot.
+# 注意：个人机器人模式——私聊仅收创建者消息，群聊所有用户 @机器人 均可触发。
+#
+# Credentials: read app_secret from environment/secret at runtime, do NOT commit to repo.
+# 凭证：app_secret 运行时从环境变量/secret 注入，勿提交到仓库。
+
+# [[projects.platforms]]
+# type = "lanxin"
+#
+# [projects.platforms.options]
+# app_id = "<your-lanxin-app-id>"
+# app_secret = "<your-lanxin-app-secret>"
+# api_base = "https://apigw.lx.qianxin.com"  # Qianxin intranet (default); public: https://openapi.lanxin.cn
+# allow_from = "*"                            # Allowed staffIds, comma-separated; personal bot: set to creator staffId
+# share_session_in_channel = false            # Share one agent session among all group users
+
 # Weixin personal (ilink bot) / 微信个人号（ilink 机器人网关）
 # Same HTTP API as OpenClaw @tencent-weixin/openclaw-weixin: long-poll getUpdates + sendMessage.
 # 与 OpenClaw 插件 openclaw-weixin 使用同一套网关：长轮询收消息 + sendMessage 下发。
