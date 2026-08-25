@@ -1,9 +1,14 @@
 package lanxin
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -110,8 +115,8 @@ func TestGetAppToken_RefreshOnExpiry(t *testing.T) {
 	}
 	// verify 5-minute early refresh (expiresIn=7200, minus 300 = 6900s)
 	expectedExpiry := time.Now().Add(6900 * time.Second)
-	if p.tokenExpiry.Before(expectedExpiry.Add(-10 * time.Second)) ||
-		p.tokenExpiry.After(expectedExpiry.Add(10 * time.Second)) {
+	if p.tokenExpiry.Before(expectedExpiry.Add(-10*time.Second)) ||
+		p.tokenExpiry.After(expectedExpiry.Add(10*time.Second)) {
 		t.Fatalf("expiry out of range: got %v, expected ~%v", p.tokenExpiry, expectedExpiry)
 	}
 }
@@ -383,5 +388,141 @@ func TestReconstructReplyCtx_TooFewParts(t *testing.T) {
 	_, err := p.ReconstructReplyCtx("lanxin:p2p")
 	if err == nil {
 		t.Fatal("expected error for session key with too few parts")
+	}
+}
+
+// reqRecorder captures request paths and the last group-message POST body
+// served by the httptest server. Thread-safe because handleFileMessage runs
+// in a goroutine and may hit the server concurrently with the test.
+type reqRecorder struct {
+	mu    sync.Mutex
+	paths []string
+	group string
+}
+
+func (r *reqRecorder) add(p string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.paths = append(r.paths, p)
+}
+
+func (r *reqRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.paths...)
+}
+
+func (r *reqRecorder) groupBody() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.group
+}
+
+// newTestPlatformWithServer wires a Platform to an httptest server that
+// answers token/bot/group/media endpoints and records what was requested.
+func newTestPlatformWithServer(t *testing.T, allowFrom string) (*Platform, *reqRecorder) {
+	t.Helper()
+	rec := &reqRecorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.add(r.URL.Path)
+		switch r.URL.Path {
+		case tokenPath:
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{"appToken":"tok","expiresIn":7200}}`))
+		case botMsgPath:
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{}}`))
+		case groupMsgPath:
+			b, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			rec.group = string(b)
+			rec.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{}}`))
+		default:
+			if strings.HasPrefix(r.URL.Path, "/v1/medias/") {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Write([]byte("file-content"))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"errCode":404,"errMsg":"not found"}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	p := &Platform{
+		appID:       "test-app",
+		appSecret:   "test-secret",
+		apiBase:     srv.URL,
+		allowFrom:   allowFrom,
+		httpClient:  srv.Client(),
+		downloadDir: t.TempDir(),
+	}
+	return p, rec
+}
+
+func waitForGroupReply(t *testing.T, rec *reqRecorder, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if b := rec.groupBody(); b != "" {
+			return b
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for group message reply; recorded paths: %v", rec.snapshot())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestHandleWSMessage_UnauthorizedMediaNotSaved verifies the allow_from gate
+// runs before the media branch: a media message from an unauthorized sender
+// must NOT trigger downloadMedia/saveMedia.
+func TestHandleWSMessage_UnauthorizedMediaNotSaved(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "alice")
+
+	raw := `{"events":[{"type":"bot_private_message","data":{"from":"bob","chatType":"p2p","msgType":"file","msgData":{"file":{"mediaIds":["m1"]}},"msgId":"m1"}}]}`
+	p.handleWSMessage([]byte(raw))
+
+	for _, path := range rec.snapshot() {
+		if strings.Contains(path, "/v1/medias/") {
+			t.Fatalf("media fetch requested for unauthorized user: %s", path)
+		}
+	}
+	entries, err := os.ReadDir(p.downloadDir)
+	if err != nil {
+		t.Fatalf("read downloadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("media file saved for unauthorized user: %v", entries)
+	}
+}
+
+// TestHandleWSMessage_GroupFileReplyTargetsGroup verifies handleFileMessage
+// addresses the group-file acknowledgement to the groupId, not the sender's
+// staffId (regression for the ev.From-vs-ev.GroupID mix-up).
+func TestHandleWSMessage_GroupFileReplyTargetsGroup(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "bob")
+
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"bob","chatType":"group","groupId":"group-456","msgType":"file","msgData":{"file":{"mediaIds":["m1"]}},"msgId":"gm1","reminder":{"isAtMe":true}}}]}`
+	p.handleWSMessage([]byte(raw))
+
+	body := waitForGroupReply(t, rec, 2*time.Second)
+
+	var reply struct {
+		GroupID string `json:"groupId"`
+	}
+	if err := json.Unmarshal([]byte(body), &reply); err != nil {
+		t.Fatalf("decode group reply body: %v", err)
+	}
+	if reply.GroupID != "group-456" {
+		t.Fatalf("group reply targeted %q, want group-456 (sender staffId must not be used as groupId)", reply.GroupID)
+	}
+
+	// positive control: the download did happen, so the negative test above
+	// (UnauthorizedMediaNotSaved) is not passing vacuously.
+	if _, err := os.Stat(filepath.Join(p.downloadDir, "m1")); err != nil {
+		t.Fatalf("expected media file to be saved: %v", err)
 	}
 }

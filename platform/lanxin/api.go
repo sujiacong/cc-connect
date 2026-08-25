@@ -8,6 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -101,6 +104,74 @@ func (p *Platform) getWSEndpoint() (string, error) {
 	}
 
 	return result.Data.WSEndpoint, nil
+}
+
+// downloadMedia fetches a media file by mediaId (GET /v1/medias/{id}/fetch).
+// Returns the raw bytes plus the Content-Disposition header (for filename).
+func (p *Platform) downloadMedia(mediaID string) ([]byte, string, error) {
+	token, err := p.getAppToken()
+	if err != nil {
+		return nil, "", fmt.Errorf("lanxin: downloadMedia: get token: %w", err)
+	}
+
+	u := p.apiBase + "/v1/medias/" + mediaID + "/fetch?app_token=" + token
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("lanxin: downloadMedia: create request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("lanxin: downloadMedia: do request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("lanxin: downloadMedia: status %d: %s",
+			resp.StatusCode, core.RedactToken(string(body), token))
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("lanxin: downloadMedia: read body: %w", err)
+	}
+	return data, resp.Header.Get("Content-Disposition"), nil
+}
+
+// mediaExtFromDisposition extracts a file extension (e.g. ".pdf") from a
+// Content-Disposition header like `attachment;filename=DNSxxx.pdf`, or ""
+// when none can be inferred. The raw header is often GBK-encoded, so we only
+// trust the extension (ASCII) and use the mediaId for the base name.
+func mediaExtFromDisposition(cd string) string {
+	idx := strings.LastIndex(cd, ".")
+	if idx < 0 {
+		return ""
+	}
+	ext := strings.TrimRight(cd[idx:], "\"'; \t\r\n")
+	if ext == "" || strings.ContainsAny(ext, "=; \t\r\n\"'") {
+		return ""
+	}
+	return ext
+}
+
+// saveMedia downloads a media file and writes it into the platform download
+// directory, returning the local absolute path.
+func (p *Platform) saveMedia(mediaID string) (string, error) {
+	data, cd, err := p.downloadMedia(mediaID)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(p.downloadDir, 0o755); err != nil {
+		return "", fmt.Errorf("lanxin: saveMedia: mkdir: %w", err)
+	}
+	path := filepath.Join(p.downloadDir, mediaID+mediaExtFromDisposition(cd))
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("lanxin: saveMedia: write: %w", err)
+	}
+	return path, nil
 }
 
 // postAPI is the shared POST helper for sendBotText/sendGroupText.

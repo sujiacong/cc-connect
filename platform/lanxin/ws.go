@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -150,7 +151,8 @@ type lanxinEvent struct {
 	MsgID        string
 	IsAtMe       bool
 	SenderName   string
-	CallbackData string // for approve_card_callback
+	CallbackData string   // for approve_card_callback
+	MediaIDs     []string // for file/image/video/voice messages
 }
 
 // parseWSMessage parses raw WS JSON, returning a list of events.
@@ -210,9 +212,20 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 
 		// extract text content msgData.text.content
 		content := ""
+		var mediaIDs []string
 		if msgData, ok := data["msgData"].(map[string]any); ok {
 			if text, ok := msgData["text"].(map[string]any); ok {
 				content, _ = text["content"].(string)
+			}
+			// extract mediaIds for file/image/video/voice messages
+			if media, ok := msgData["file"].(map[string]any); ok {
+				if ids, ok := media["mediaIds"].([]any); ok {
+					for _, id := range ids {
+						if s, ok := id.(string); ok && s != "" {
+							mediaIDs = append(mediaIDs, s)
+						}
+					}
+				}
 			}
 		}
 
@@ -226,6 +239,7 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 			MsgID:      getString(data, "msgId"),
 			IsAtMe:     isAtMe,
 			SenderName: getString(data, "senderName"),
+			MediaIDs:   mediaIDs,
 		})
 	}
 	return result
@@ -272,23 +286,28 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			continue
 		}
 
-		// allow_from permission
+		// allow_from permission — checked before any media download so
+		// unauthorized senders cannot trigger ingestion or leak local paths
 		if !core.AllowList(p.allowFrom, ev.From) {
 			slog.Debug("lanxin: message from unauthorized user", "user", ev.From)
-			rc := replyContext{chatType: ev.ChatType, target: ev.From, senderName: ev.SenderName}
+			rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName}
 			if err := p.Reply(context.Background(), rc, core.UnauthorizedAccessMessage); err != nil {
 				slog.Warn("lanxin: unauthorized reply failed", "error", err)
 			}
 			continue
 		}
 
-		// build session key and replyContext
-		var target string
-		if ev.ChatType == "group" {
-			target = ev.GroupID
-		} else {
-			target = ev.From
+		// File/media messages: download asynchronously (do not block the WS
+		// read loop, whose 40s read deadline would otherwise expire mid-download),
+		// then reply with saved paths; never route the empty text to the agent.
+		if len(ev.MediaIDs) > 0 {
+			slog.Info("lanxin: file message received", "user", ev.From, "chatType", ev.ChatType, "msgType", ev.MsgType, "media_ids", ev.MediaIDs)
+			go p.handleFileMessage(ev)
+			continue
 		}
+
+		// build session key and replyContext
+		target := replyTarget(ev)
 
 		var sessionKey string
 		if ev.ChatType == "group" && !p.shareSessionInChannel {
@@ -321,5 +340,40 @@ func (p *Platform) handleWSMessage(raw []byte) {
 
 		slog.Debug("lanxin: text received", "user", ev.From, "chatType", ev.ChatType, "len", len(ev.Content))
 		go p.handler(p, msg)
+	}
+}
+
+// replyTarget returns the destination for a reply to this event: the groupId
+// for group chat, or the sender's staffId for private chat.
+func replyTarget(ev lanxinEvent) string {
+	if ev.ChatType == "group" {
+		return ev.GroupID
+	}
+	return ev.From
+}
+
+// handleFileMessage downloads all attached media files and replies with the
+// saved local paths (bot-log-analysis style log-package intake).
+func (p *Platform) handleFileMessage(ev lanxinEvent) {
+	var saved []string
+	for _, mid := range ev.MediaIDs {
+		path, err := p.saveMedia(mid)
+		if err != nil {
+			slog.Warn("lanxin: save media failed", "media_id", mid, "error", err)
+			continue
+		}
+		saved = append(saved, path)
+	}
+
+	reply := "已收到文件"
+	if len(saved) > 0 {
+		reply += "，保存到：\n" + strings.Join(saved, "\n")
+	} else {
+		reply += "，但下载失败，请重试"
+	}
+
+	rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName}
+	if err := p.Reply(context.Background(), rc, reply); err != nil {
+		slog.Warn("lanxin: file reply failed", "error", err)
 	}
 }

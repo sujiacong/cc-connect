@@ -24,6 +24,10 @@ const (
 
 const defaultAPIBase = "https://apigw.lx.qianxin.com"
 
+// defaultDownloadDir is where received file/media messages are saved
+// (configurable via file_download_dir platform option).
+const defaultDownloadDir = "/root/icg-ai-bot/uploads"
+
 // Platform implements core.Platform for the Lanxin personal bot via WebSocket
 // long-connection (outbound, no public URL needed).
 type Platform struct {
@@ -31,6 +35,7 @@ type Platform struct {
 	appSecret             string
 	apiBase               string
 	allowFrom             string
+	downloadDir           string
 	handler               core.MessageHandler
 	dedup                 core.MessageDedup
 	httpClient            *http.Client
@@ -72,6 +77,11 @@ func New(opts map[string]any) (core.Platform, error) {
 	allowFrom, _ := opts["allow_from"].(string)
 	core.CheckAllowFrom(platformName, allowFrom)
 
+	downloadDir, _ := opts["file_download_dir"].(string)
+	if downloadDir == "" {
+		downloadDir = defaultDownloadDir
+	}
+
 	shareSession, _ := opts["share_session_in_channel"].(bool)
 
 	slog.Warn("lanxin: personal bot mode — private chat only receives creator messages")
@@ -81,6 +91,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		appSecret:             appSecret,
 		apiBase:               apiBase,
 		allowFrom:             allowFrom,
+		downloadDir:           downloadDir,
 		httpClient:            &http.Client{Timeout: 30 * time.Second},
 		shareSessionInChannel: shareSession,
 	}, nil
