@@ -221,8 +221,10 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 
 	// Claude Code rejects bypassPermissions when running as root.
 	// Downgrade to "auto" which auto-approves internally in cc-connect.
+	// IS_SANDBOX=1 (injected via systemd service env) opts out of the
+	// downgrade so the CLI's own --dangerously-skip-permissions can work.
 	var rootDowngradeWarning string
-	if mode == "bypassPermissions" && os.Geteuid() == 0 {
+	if mode == "bypassPermissions" && os.Geteuid() == 0 && os.Getenv("IS_SANDBOX") != "1" {
 		slog.Warn("claudeSession: bypassPermissions not allowed under root, downgrading to auto mode")
 		mode = "auto"
 		rootDowngradeWarning = "⚠️ Running as root: bypassPermissions mode is not supported and has been downgraded to auto. The agent may still pause on high-risk operations."
