@@ -57,6 +57,7 @@ type replyContext struct {
 	senderName string
 	msgID      string
 	proactive  bool
+	fromUserID string // sender openId; used to @-mention in group replies
 }
 
 func init() {
@@ -124,7 +125,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	case "p2p":
 		err = p.sendBotText(rc.target, content)
 	case "group":
-		err = p.sendGroupText(rc.target, content)
+		err = p.sendGroupText(rc.target, content, rc.fromUserID)
 	default:
 		return fmt.Errorf("lanxin: unknown chatType %q", rc.chatType)
 	}

@@ -200,8 +200,10 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 			continue
 		}
 
+		// Lanxin distinguishes group vs private via the event TYPE (bot_group_message),
+		// not a chatType field — the payload has groupId but no chatType.
 		chatType := "p2p"
-		if getString(data, "chatType") == "group" {
+		if etype == "bot_group_message" {
 			chatType = "group"
 		}
 
@@ -262,6 +264,14 @@ func truncateForLog(raw []byte) string {
 // handleWSMessage dispatches parsed events to the handler.
 func (p *Platform) handleWSMessage(raw []byte) {
 	events := parseWSMessage(raw)
+	// TEMP-DEBUG: log raw event fields for group-vs-private diagnosis
+	for _, ev := range events {
+		c := ev.Content
+		if len(c) > 40 {
+			c = c[:40]
+		}
+		slog.Info("lanxin: ws event", "type", ev.EventType, "chatType", ev.ChatType, "groupId", ev.GroupID, "from", ev.From, "msgType", ev.MsgType, "content", c, "content_len", len(ev.Content))
+	}
 	for _, ev := range events {
 		switch ev.EventType {
 		case "approve_card_callback":
@@ -290,7 +300,7 @@ func (p *Platform) handleWSMessage(raw []byte) {
 		// unauthorized senders cannot trigger ingestion or leak local paths
 		if !core.AllowList(p.allowFrom, ev.From) {
 			slog.Debug("lanxin: message from unauthorized user", "user", ev.From)
-			rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName}
+			rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName, fromUserID: ev.From}
 			if err := p.Reply(context.Background(), rc, core.UnauthorizedAccessMessage); err != nil {
 				slog.Warn("lanxin: unauthorized reply failed", "error", err)
 			}
@@ -321,6 +331,13 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			chatName = ev.GroupID
 		}
 
+		content := ev.Content
+		if ev.ChatType == "group" {
+			// Lanxin group messages carry a "@botname " mention prefix (e.g.
+			// "@ICG智能助手 /help"). Strip it so slash commands are recognized.
+			content = stripMentionPrefix(content)
+		}
+
 		msg := &core.Message{
 			SessionKey: sessionKey,
 			Platform:   platformName,
@@ -328,13 +345,14 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			UserID:     ev.From,
 			UserName:   ev.SenderName,
 			ChatName:   chatName,
-			Content:    ev.Content,
+			Content:    content,
 			ReplyCtx: replyContext{
 				chatType:   ev.ChatType,
 				target:     target,
 				senderName: ev.SenderName,
 				msgID:      ev.MsgID,
 				proactive:  false,
+				fromUserID: ev.From,
 			},
 		}
 
@@ -372,8 +390,27 @@ func (p *Platform) handleFileMessage(ev lanxinEvent) {
 		reply += "，但下载失败，请重试"
 	}
 
-	rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName}
+	rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName, fromUserID: ev.From}
 	if err := p.Reply(context.Background(), rc, reply); err != nil {
 		slog.Warn("lanxin: file reply failed", "error", err)
 	}
+}
+
+
+// stripMentionPrefix removes a leading "@botname " mention segment from a
+// group-chat message. Lanxin pushes group messages as "@botname <text>"; the
+// mention is not part of the user's actual intent and would otherwise prevent
+// slash-command detection (strings.HasPrefix(content, "/")).
+func stripMentionPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "@") {
+		return s
+	}
+	// Find the end of the mention: first whitespace after '@'.
+	idx := strings.IndexByte(s, ' ')
+	if idx < 0 {
+		// Pure mention ("@botname") with nothing after — treat as empty intent.
+		return ""
+	}
+	return strings.TrimSpace(s[idx+1:])
 }

@@ -211,7 +211,7 @@ func TestSendGroupText_Success(t *testing.T) {
 		appToken:    "fake-token",
 		tokenExpiry: time.Now().Add(1 * time.Hour),
 	}
-	err := p.sendGroupText("group-456", "hello group")
+	err := p.sendGroupText("group-456", "hello group", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

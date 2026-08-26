@@ -3326,7 +3326,7 @@ var messages = map[MsgKey]map[Language]string{
 	},
 	MsgCommandDisabled: {
 		LangEnglish:            "🚫 Command `%s` is disabled for this project.",
-		LangChinese:            "🚫 命令 `%s` 在当前项目中已被禁用。",
+		LangChinese:            "🚫 命令 `%s` 不支持。",
 		LangTraditionalChinese: "🚫 命令 `%s` 在當前專案中已被停用。",
 		LangJapanese:           "🚫 コマンド `%s` はこのプロジェクトで無効化されています。",
 		LangSpanish:            "🚫 El comando `%s` está deshabilitado para este proyecto.",

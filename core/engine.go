@@ -9149,11 +9149,63 @@ func langDisplayName(lang Language) string {
 }
 
 func (e *Engine) cmdHelp(p Platform, msg *Message) {
-	if !supportsCards(p) {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHelp))
+	// Lanxin: send as copyable, well-formatted Markdown text instead of a card
+	// (cards render as non-copyable interactive components on Lanxin).
+	if p.Name() == "lanxin" || !supportsCards(p) {
+		e.reply(p, msg.ReplyCtx, e.renderHelpText())
 		return
 	}
 	e.replyWithCard(p, msg.ReplyCtx, e.renderHelpCard())
+}
+
+// renderHelpText renders a plain-text command list honoring disabled_commands
+// and including custom commands (parity with renderHelpGroupCard for
+// platforms that do not support cards, e.g. lanxin).
+func (e *Engine) renderHelpText() string {
+	e.userRolesMu.RLock()
+	disabledCmds := e.disabledCmds
+	e.userRolesMu.RUnlock()
+
+	var b strings.Builder
+	b.WriteString("📖 ICG 智能助手帮助\n")
+	b.WriteString("━━━━━━━━━━━━━━━━━━\n")
+	b.WriteString("发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。\n\n")
+
+	// Flatten all enabled commands (built-in + custom) into one list with descriptions.
+	for _, group := range helpCardGroups() {
+		sectionText := e.i18n.T(group.titleKey)
+		for _, line := range strings.Split(sectionText, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "**") {
+				continue
+			}
+			cmdPart := strings.Fields(line)[0]
+			cmdName := strings.TrimPrefix(cmdPart, "/")
+			if disabledCmds[strings.ToLower(cmdName)] {
+				continue
+			}
+			b.WriteString("• " + line + "\n")
+		}
+	}
+
+	// Custom commands.
+	for _, c := range e.commands.ListAll() {
+		d := strings.TrimSpace(c.Description)
+		if d != "" {
+			b.WriteString("• /" + c.Name + " — " + d + "\n")
+		} else {
+			b.WriteString("• /" + c.Name + "\n")
+		}
+	}
+	return b.String()
+}
+
+func (e *Engine) sectionTitle(key MsgKey) string {
+	t := e.i18n.T(key)
+	if idx := strings.IndexByte(t, '\n'); idx >= 0 {
+		return t[:idx]
+	}
+	return strings.TrimSpace(t)
 }
 
 // cmdStart handles the `/start` slash command.
@@ -9289,10 +9341,6 @@ func (e *Engine) renderHelpGroupCard(groupKey string) *Card {
 	tabLabel := func(key MsgKey) string {
 		return strings.Trim(sectionTitle(key), "* ")
 	}
-	commandText := func(command string) string {
-		return "**" + command + "**  " + e.i18n.T(MsgKey(strings.TrimPrefix(command, "/")))
-	}
-
 	groups := helpCardGroups()
 	current := groups[0]
 	normalizedGroup := strings.ToLower(strings.TrimSpace(groupKey))
@@ -9301,6 +9349,25 @@ func (e *Engine) renderHelpGroupCard(groupKey string) *Card {
 			current = group
 			break
 		}
+	}
+
+	// Filter out disabled commands and append custom commands (help parity with GetAllCommands).
+	e.userRolesMu.RLock()
+	disabledCmds := e.disabledCmds
+	e.userRolesMu.RUnlock()
+	items := make([]helpCardItem, 0, len(current.items))
+	for _, item := range current.items {
+		cid := strings.ToLower(strings.TrimPrefix(item.command, `/`))
+		if cid != "" && disabledCmds[cid] {
+			continue
+		}
+		items = append(items, item)
+	}
+	// Append custom commands from the registry (render name + description).
+	customByID := make(map[string]string)
+	for _, c := range e.commands.ListAll() {
+		customByID[c.Name] = c.Description
+		items = append(items, helpCardItem{command: "/" + c.Name, action: "cmd:/" + c.Name})
 	}
 
 	cb := NewCard().Title(e.i18n.T(MsgHelpTitle), "blue")
@@ -9315,8 +9382,15 @@ func (e *Engine) renderHelpGroupCard(groupKey string) *Card {
 	for _, row := range splitHelpTabRows(true, tabs) {
 		cb.ButtonsEqual(row...)
 	}
-	for _, item := range current.items {
-		cb.ListItem(commandText(item.command), "▶", item.action)
+	for _, item := range items {
+		cmdName := strings.TrimPrefix(item.command, "/")
+		desc := ""
+		if d, ok := customByID[cmdName]; ok {
+			desc = d
+		} else {
+			desc = e.i18n.T(MsgKey(cmdName))
+		}
+		cb.ListItem("**"+item.command+"**  "+desc, "▶", item.action)
 	}
 	cb.Note(e.i18n.T(MsgHelpTip))
 	return cb.Build()

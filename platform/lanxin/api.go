@@ -34,17 +34,23 @@ func (p *Platform) sendBotText(target string, content string) error {
 }
 
 // sendGroupText sends a text message to a group (aligned with client.py:155-165).
-func (p *Platform) sendGroupText(target string, content string) error {
+func (p *Platform) sendGroupText(target string, content string, mentionUserID string) error {
 	token, err := p.getAppToken()
 	if err != nil {
 		return fmt.Errorf("lanxin: sendGroupText: get token: %w", err)
+	}
+
+	text := map[string]any{"content": content}
+	if mentionUserID != "" {
+		// @-mention the asking user so they get notified in group chat
+		text["reminder"] = map[string]any{"all": false, "userIds": []string{mentionUserID}}
 	}
 
 	payload := map[string]any{
 		"groupId": target,
 		"msgType": "text",
 		"msgData": map[string]any{
-			"text": map[string]string{"content": content},
+			"text": text,
 		},
 	}
 	return p.postAPI(groupMsgPath, token, payload, "sendGroupText")

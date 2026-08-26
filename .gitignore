@@ -153,3 +153,6 @@ credentials/
 
 .codex
 cc-connect-new
+
+# CC-Connect agent runtime state (project memory / sessions / state)
+.omc/
