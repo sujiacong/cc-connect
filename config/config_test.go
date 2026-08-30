@@ -2010,6 +2010,64 @@ func TestLoadRejectsInvalidRelayVisibility(t *testing.T) {
 		t.Fatalf("error = %q, want relay.visibility validation error", err.Error())
 	}
 }
+
+const helpTextConfigFixture = `[[projects]]
+name = "demo"
+help_title = "📖 测试助手帮助"
+help_intro = "测试提示语，输入 /new 开始。"
+
+[projects.agent]
+type = "codex"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+token = "test-token"
+`
+
+func TestLoadHelpTextOverrides(t *testing.T) {
+	configPath := writeConfigFixture(t, helpTextConfigFixture)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Projects) != 1 {
+		t.Fatalf("projects = %d, want 1", len(cfg.Projects))
+	}
+	proj := cfg.Projects[0]
+	if proj.HelpTitle == nil {
+		t.Fatal("cfg.Projects[0].HelpTitle = nil, want non-nil")
+	}
+	if *proj.HelpTitle != "📖 测试助手帮助" {
+		t.Fatalf("HelpTitle = %q, want %q", *proj.HelpTitle, "📖 测试助手帮助")
+	}
+	if proj.HelpIntro == nil {
+		t.Fatal("cfg.Projects[0].HelpIntro = nil, want non-nil")
+	}
+	if *proj.HelpIntro != "测试提示语，输入 /new 开始。" {
+		t.Fatalf("HelpIntro = %q, want %q", *proj.HelpIntro, "测试提示语，输入 /new 开始。")
+	}
+}
+
+func TestLoadHelpTextUnsetStaysNil(t *testing.T) {
+	configPath := writeConfigFixture(t, baseConfigTOML)
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.Projects) != 1 {
+		t.Fatalf("projects = %d, want 1", len(cfg.Projects))
+	}
+	if cfg.Projects[0].HelpTitle != nil {
+		t.Fatalf("HelpTitle = %v, want nil when unset", *cfg.Projects[0].HelpTitle)
+	}
+	if cfg.Projects[0].HelpIntro != nil {
+		t.Fatalf("HelpIntro = %v, want nil when unset", *cfg.Projects[0].HelpIntro)
+	}
+}
 func writeConfigFixture(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()

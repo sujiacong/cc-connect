@@ -428,6 +428,20 @@ type Engine struct {
 	autoCompressMaxTokens int
 	autoCompressMinGap    time.Duration
 	resetOnIdle           time.Duration
+	// maxConcurrentSessions caps the number of sessions simultaneously busy
+	// processing a message (active conversations). 0 = unlimited. When the cap
+	// is reached, new sessions are rejected with a "conversation full" notice;
+	// sessions already busy keep queueing follow-ups as usual. Atomic because
+	// config reload writes it while message goroutines read it.
+	maxConcurrentSessions atomic.Int32
+
+	// helpTitle / helpIntro override the /help plain-text header and intro line
+	// (see renderHelpText). Empty strings fall back to the built-in defaults, so
+	// existing configs that never set them keep byte-identical output. Guarded
+	// by helpTextMu because config reload writes them while /help renders them.
+	helpTextMu sync.RWMutex
+	helpTitle  string
+	helpIntro  string
 
 	// Reply footer composition flags. The footer renders up to two lines:
 	//   line 1 — model · [effort ·] out/in/cw/cr · ctx%   (gated by showContextIndicator)
@@ -954,6 +968,55 @@ func (e *Engine) SetResetOnIdle(d time.Duration) {
 		return
 	}
 	e.resetOnIdle = d
+}
+
+// SetMaxConcurrentSessions 限制同时活跃的对话会话数（正在处理消息的会话数）。
+// 0 或负值表示不限制。达到上限时新会话的消息会被拒绝并收到提示。
+func (e *Engine) SetMaxConcurrentSessions(n int) {
+	if n <= 0 {
+		e.maxConcurrentSessions.Store(0)
+		return
+	}
+	e.maxConcurrentSessions.Store(int32(n))
+}
+
+// SetHelpTitle 覆盖 /help 文本帮助的标题行（renderHelpText 首行）。
+// 空字符串表示使用内置默认文案。
+func (e *Engine) SetHelpTitle(s string) {
+	e.helpTextMu.Lock()
+	e.helpTitle = s
+	e.helpTextMu.Unlock()
+}
+
+// SetHelpIntro 覆盖 /help 文本帮助的提示语行。
+// 空字符串表示使用内置默认文案。
+func (e *Engine) SetHelpIntro(s string) {
+	e.helpTextMu.Lock()
+	e.helpIntro = s
+	e.helpTextMu.Unlock()
+}
+
+// checkConcurrentSessionLimit 在会话上限开启时，拒绝"新对话"（当前会话尚未被
+// 占用）在活跃会话数达到上限后进入 agent。已占用会话（用户正在对话中）的后续
+// 消息放行，由原有队列逻辑处理。只统计 KindConversation 会话（cron/timer 的
+// side session 不占对话名额）。返回 true 表示允许继续处理。
+func (e *Engine) checkConcurrentSessionLimit(p Platform, msg *Message, sessions *SessionManager, session *Session) bool {
+	max := int(e.maxConcurrentSessions.Load())
+	if max <= 0 {
+		return true
+	}
+	// 当前会话已在对话中：不算新增并发会话，放行（TryLock 失败会走排队逻辑）。
+	if session.Busy() {
+		return true
+	}
+	if active := sessions.BusyConversationCount(); active >= max {
+		slog.Info("message rejected: concurrent session limit reached",
+			"project", e.name, "max", max, "active", active,
+			"session", session.ID, "user", msg.UserName)
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConcurrentSessionLimit, max))
+		return false
+	}
+	return true
 }
 
 // SetAgentSessionIdleTimeout 配置单轮正常结束后的 live agent 空闲关闭时间。
@@ -2977,6 +3040,17 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
 	}
 
+	// Enforce the per-project max concurrent conversation limit before any
+	// path that can start an agent turn (slash commands below included —
+	// custom prompt commands execute a full turn). New conversations are
+	// rejected with a notice when the cap is reached; sessions already busy
+	// keep queueing follow-ups normally.
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	if !e.checkConcurrentSessionLimit(p, msg, sessions, session) {
+		return
+	}
+
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
 		if e.handleCommand(p, msg, content) {
 			return
@@ -3030,8 +3104,6 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
-	session := sessions.GetOrCreateActive(msg.SessionKey)
-	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	// Ensure an interactiveState entry exists before taking the session lock.
 	// Without this, concurrent messages can observe the session as busy during
 	// startup but still find no state to queue into.
@@ -6786,7 +6858,13 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 	case "ps":
 		e.cmdPs(p, msg, args)
 	default:
-		if custom, ok := e.commands.Resolve(cmd); ok {
+		custom, ok := e.commands.Resolve(cmd)
+		if !ok {
+			// Unique-prefix completion (e.g. /bug-a → bug-analyze); Resolve
+			// keeps exact semantics for existence checks elsewhere.
+			custom, ok = e.commands.ResolveByPrefix(cmd)
+		}
+		if ok {
 			if disabledCmds[strings.ToLower(custom.Name)] {
 				slog.Info("audit: command_blocked",
 					"user_id", msg.UserID, "platform", msg.Platform,
@@ -9460,6 +9538,14 @@ func (e *Engine) cmdHelp(p Platform, msg *Message) {
 	e.replyWithCard(p, msg.ReplyCtx, e.renderHelpCard())
 }
 
+// Built-in defaults for the /help plain-text header and intro line. They are
+// used when the project config does not set help_title / help_intro (or the
+// setters receive an empty string), keeping output identical to older builds.
+const (
+	defaultHelpTitle = "📖 ICG 智能助手帮助"
+	defaultHelpIntro = "发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。"
+)
+
 // renderHelpText renders a plain-text command list honoring disabled_commands
 // and including custom commands (parity with renderHelpGroupCard for
 // platforms that do not support cards, e.g. lanxin).
@@ -9468,10 +9554,21 @@ func (e *Engine) renderHelpText() string {
 	disabledCmds := e.disabledCmds
 	e.userRolesMu.RUnlock()
 
+	e.helpTextMu.RLock()
+	title := e.helpTitle
+	intro := e.helpIntro
+	e.helpTextMu.RUnlock()
+	if title == "" {
+		title = defaultHelpTitle
+	}
+	if intro == "" {
+		intro = defaultHelpIntro
+	}
+
 	var b strings.Builder
-	b.WriteString("📖 ICG 智能助手帮助\n")
+	b.WriteString(title + "\n")
 	b.WriteString("━━━━━━━━━━━━━━━━━━\n")
-	b.WriteString("发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。\n\n")
+	b.WriteString(intro + "\n\n")
 
 	// Flatten all enabled commands (built-in + custom) into one list with descriptions.
 	for _, group := range helpCardGroups() {
@@ -9500,14 +9597,6 @@ func (e *Engine) renderHelpText() string {
 		}
 	}
 	return b.String()
-}
-
-func (e *Engine) sectionTitle(key MsgKey) string {
-	t := e.i18n.T(key)
-	if idx := strings.IndexByte(t, '\n'); idx >= 0 {
-		return t[:idx]
-	}
-	return strings.TrimSpace(t)
 }
 
 // cmdStart handles the `/start` slash command.

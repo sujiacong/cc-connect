@@ -719,6 +719,25 @@ func main() {
 			}
 		}
 
+		// Wire max concurrent conversation sessions (nil / <=0 = unlimited)
+		if proj.MaxConcurrentSessions != nil {
+			engine.SetMaxConcurrentSessions(*proj.MaxConcurrentSessions)
+		} else {
+			engine.SetMaxConcurrentSessions(0)
+		}
+
+		// Wire /help text overrides (nil/empty = built-in defaults)
+		if proj.HelpTitle != nil {
+			engine.SetHelpTitle(*proj.HelpTitle)
+		} else {
+			engine.SetHelpTitle("")
+		}
+		if proj.HelpIntro != nil {
+			engine.SetHelpIntro(*proj.HelpIntro)
+		} else {
+			engine.SetHelpIntro("")
+		}
+
 		// Wire sender injection
 		if proj.InjectSender != nil {
 			engine.SetInjectSender(*proj.InjectSender)
@@ -1803,6 +1822,25 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		// A reload may remove this option after timers were scheduled; reset
 		// explicitly so those stale idle-close timers cannot fire later.
 		engine.SetAgentSessionIdleTimeout(0)
+	}
+
+	// Reload max concurrent conversation sessions (nil / <=0 = unlimited)
+	if proj.MaxConcurrentSessions != nil {
+		engine.SetMaxConcurrentSessions(*proj.MaxConcurrentSessions)
+	} else {
+		engine.SetMaxConcurrentSessions(0)
+	}
+
+	// Reload /help text overrides (nil/empty = built-in defaults)
+	if proj.HelpTitle != nil {
+		engine.SetHelpTitle(*proj.HelpTitle)
+	} else {
+		engine.SetHelpTitle("")
+	}
+	if proj.HelpIntro != nil {
+		engine.SetHelpIntro(*proj.HelpIntro)
+	} else {
+		engine.SetHelpIntro("")
 	}
 
 	// Reload instant reply

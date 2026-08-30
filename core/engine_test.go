@@ -3425,6 +3425,103 @@ func TestHandleMessage_MultiWorkspacePreservesCCSessionKey(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_MaxConcurrentSessions_RejectsNewConversation(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetMaxConcurrentSessions(2)
+
+	// Occupy two sessions to simulate two in-flight conversations.
+	key1, key2 := "test:user1", "test:user2"
+	s1 := e.sessions.GetOrCreateActive(key1)
+	s2 := e.sessions.GetOrCreateActive(key2)
+	if !s1.TryLock() || !s2.TryLock() {
+		t.Fatal("failed to pre-lock sessions")
+	}
+
+	// A third user starting a brand-new conversation must be rejected at the
+	// limit, and the message must NOT reach the agent.
+	msg := &Message{
+		SessionKey: "test:user3",
+		Platform:   "test",
+		UserID:     "u3",
+		UserName:   "user3",
+		Content:    "hello",
+		ReplyCtx:   "ctx",
+	}
+	e.handleMessage(p, msg)
+
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != e.i18n.Tf(MsgConcurrentSessionLimit, 2) {
+		t.Fatalf("sent = %#v, want one concurrent-limit rejection notice", sent)
+	}
+	s3 := e.sessions.GetOrCreateActive("test:user3")
+	if got := len(s3.GetHistory(0)); got != 0 {
+		t.Fatalf("rejected session history len = %d, want 0 (message must not enter agent)", got)
+	}
+}
+
+func TestHandleMessage_MaxConcurrentSessions_BusySessionStillQueues(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetMaxConcurrentSessions(1)
+
+	key1, key2 := "test:user1", "test:user2"
+	s1 := e.sessions.GetOrCreateActive(key1)
+	e.sessions.GetOrCreateActive(key2)
+	if !s1.TryLock() {
+		t.Fatal("failed to pre-lock session")
+	}
+
+	// user2 (new session) is rejected when the only slot is taken.
+	msg2 := &Message{
+		SessionKey: key2, Platform: "test", UserID: "u2", UserName: "user2",
+		Content: "hello", ReplyCtx: "ctx",
+	}
+	e.handleMessage(p, msg2)
+	if sent := p.getSent(); len(sent) != 1 || sent[0] != e.i18n.Tf(MsgConcurrentSessionLimit, 1) {
+		t.Fatalf("user2 sent = %#v, want rejection notice", sent)
+	}
+	p.clearSent()
+
+	// user1 is already mid-conversation: its follow-up must NOT be rejected;
+	// it is queued behind the running turn instead.
+	msg1 := &Message{
+		SessionKey: key1, Platform: "test", UserID: "u1", UserName: "user1",
+		Content: "ps message", ReplyCtx: "ctx",
+	}
+	e.handleMessage(p, msg1)
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != e.i18n.T(MsgMessageQueued) {
+		t.Fatalf("user1 follow-up sent = %#v, want queue acknowledgement, not rejection", sent)
+	}
+}
+
+func TestHandleMessage_MaxConcurrentSessions_UnsetMeansUnlimited(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	// SetMaxConcurrentSessions never called → 0 → unlimited.
+
+	s1 := e.sessions.GetOrCreateActive("test:user1")
+	if !s1.TryLock() {
+		t.Fatal("failed to pre-lock session")
+	}
+	msg := &Message{
+		SessionKey: "test:user2", Platform: "test", UserID: "u2", UserName: "user2",
+		Content: "hello", ReplyCtx: "ctx",
+	}
+	e.handleMessage(p, msg)
+
+	// No rejection: the message is accepted and the session is locked for
+	// processing (the stub agent never completes a turn, so the lock persists).
+	if sent := p.getSent(); len(sent) > 0 && sent[0] == e.i18n.Tf(MsgConcurrentSessionLimit, 1) {
+		t.Fatalf("unexpected rejection: %#v", sent)
+	}
+	s2 := e.sessions.GetOrCreateActive("test:user2")
+	if !s2.Busy() {
+		t.Fatal("expected user2 session to be accepted and locked for processing")
+	}
+}
+
 func TestHandleMessage_AutoResetOnIdle_RotatesToNewSession(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	agentSession := newResultAgentSession("fresh reply")
@@ -13326,6 +13423,54 @@ func TestEngine_SetterMethods(t *testing.T) {
 	// Verify setters didn't break core functionality
 	if e.GetAgent() == nil {
 		t.Error("GetAgent should still work after setters")
+	}
+}
+
+func TestEngine_HelpTextDefaults(t *testing.T) {
+	e := newTestEngine()
+	out := e.renderHelpText()
+
+	if !strings.Contains(out, "📖 ICG 智能助手帮助\n") {
+		t.Errorf("default help title missing from output:\n%s", out)
+	}
+	if !strings.Contains(out, "发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。") {
+		t.Errorf("default help intro missing from output:\n%s", out)
+	}
+}
+
+func TestEngine_HelpTextOverrides(t *testing.T) {
+	e := newTestEngine()
+	e.SetHelpTitle("📖 新的助手帮助")
+	e.SetHelpIntro("输入 /new 开启新对话，/stop 停止当前任务。")
+
+	out := e.renderHelpText()
+
+	if !strings.Contains(out, "📖 新的助手帮助\n") {
+		t.Errorf("configured help title missing from output:\n%s", out)
+	}
+	if strings.Contains(out, "ICG 智能助手帮助") {
+		t.Errorf("default help title still present after override:\n%s", out)
+	}
+	if !strings.Contains(out, "输入 /new 开启新对话，/stop 停止当前任务。") {
+		t.Errorf("configured help intro missing from output:\n%s", out)
+	}
+	if strings.Contains(out, "发送 /new 开启新话题") {
+		t.Errorf("default help intro still present after override:\n%s", out)
+	}
+}
+
+func TestEngine_HelpTextEmptyOverrideKeepsDefault(t *testing.T) {
+	e := newTestEngine()
+	e.SetHelpTitle("")
+	e.SetHelpIntro("")
+
+	out := e.renderHelpText()
+
+	if !strings.Contains(out, "📖 ICG 智能助手帮助\n") {
+		t.Errorf("default help title missing after empty override:\n%s", out)
+	}
+	if !strings.Contains(out, "发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。") {
+		t.Errorf("default help intro missing after empty override:\n%s", out)
 	}
 }
 

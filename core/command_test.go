@@ -47,6 +47,94 @@ func TestCommandRegistry_Remove(t *testing.T) {
 	}
 }
 
+func TestCommandRegistry_ResolvePrefixIsNotExact(t *testing.T) {
+	r := NewCommandRegistry()
+	r.Add("bug-analyze", "desc", "prompt", "", "", "config")
+
+	// Exact existence checks must not be confused by prefix matching: adding
+	// a distinct command whose name is a prefix of an existing one is legal.
+	if _, ok := r.Resolve("bug"); ok {
+		t.Error("Resolve(\"bug\") must not match \"bug-analyze\" — existence checks rely on exact semantics")
+	}
+}
+
+func TestCommandRegistry_ResolveByPrefix(t *testing.T) {
+	r := NewCommandRegistry()
+	r.Add("bug-analyze", "desc", "prompt", "", "", "config")
+
+	if cmd, ok := r.ResolveByPrefix("bug-a"); !ok || cmd.Name != "bug-analyze" {
+		t.Errorf("ResolveByPrefix(\"bug-a\") = %v, %v; want bug-analyze, true", cmd, ok)
+	}
+	// Hyphen/underscore fold like Resolve.
+	if cmd, ok := r.ResolveByPrefix("bug_a"); !ok || cmd.Name != "bug-analyze" {
+		t.Errorf("ResolveByPrefix(\"bug_a\") = %v, %v; want bug-analyze, true (normalized)", cmd, ok)
+	}
+}
+
+func TestCommandRegistry_ResolveByPrefixEmptyRejected(t *testing.T) {
+	r := NewCommandRegistry()
+	r.Add("deploy", "desc", "prompt", "", "", "config")
+
+	// A lone "/" must not resolve the only registered command.
+	if _, ok := r.ResolveByPrefix(""); ok {
+		t.Error("ResolveByPrefix(\"\") must not resolve")
+	}
+	if _, ok := r.ResolveByPrefix("/"); ok {
+		t.Error("ResolveByPrefix(\"/\") must not resolve")
+	}
+}
+
+func TestCommandRegistry_ResolveByPrefixAmbiguous(t *testing.T) {
+	r := NewCommandRegistry()
+	r.Add("bug-analyze", "desc", "prompt", "", "", "config")
+	r.Add("bug-audit", "desc", "prompt", "", "", "config")
+
+	// Normalized: bug_analyze / bug_audit share the prefix bug_a.
+	if _, ok := r.ResolveByPrefix("bug"); ok {
+		t.Error("ambiguous prefix must not resolve")
+	}
+	if _, ok := r.ResolveByPrefix("bug-a"); ok {
+		t.Error("ambiguous prefix must not resolve")
+	}
+	// bug_an is still a unique prefix of bug_analyze (bug_audit diverges at
+	// bug_au), so it resolves.
+	if cmd, ok := r.ResolveByPrefix("bug_an"); !ok || cmd.Name != "bug-analyze" {
+		t.Errorf("ResolveByPrefix(\"bug_an\") = %v, %v; want bug-analyze, true", cmd, ok)
+	}
+}
+
+func TestCommandRegistry_ResolveByPrefixExactAlsoMatches(t *testing.T) {
+	r := NewCommandRegistry()
+	r.Add("bug-analyze", "desc", "prompt", "", "", "config")
+
+	if cmd, ok := r.ResolveByPrefix("bug-analyze"); !ok || cmd.Name != "bug-analyze" {
+		t.Errorf("ResolveByPrefix(exact) = %v, %v; want bug-analyze, true", cmd, ok)
+	}
+}
+
+func TestSessionManager_BusyConversationCount_SideSessionsExcluded(t *testing.T) {
+	sm := NewSessionManager("")
+
+	conv := sm.GetOrCreateActive("user1")
+	side := sm.NewSideSession("user1", "cron-job1")
+
+	if !conv.TryLock() {
+		t.Fatal("failed to lock conversation session")
+	}
+	if !side.TryLock() {
+		t.Fatal("failed to lock side session")
+	}
+	if got := sm.BusyConversationCount(); got != 1 {
+		t.Fatalf("BusyConversationCount = %d, want 1 (side session excluded)", got)
+	}
+
+	conv.Unlock()
+	side.Unlock()
+	if got := sm.BusyConversationCount(); got != 0 {
+		t.Fatalf("BusyConversationCount after unlock = %d, want 0", got)
+	}
+}
+
 func TestCommandRegistry_ClearSource(t *testing.T) {
 	r := NewCommandRegistry()
 	r.Add("a", "", "", "", "", "config")

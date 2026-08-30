@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,13 +24,26 @@ const ContinueSession = "__continue__"
 // active slot.
 const ExplicitActivationTTL = 7 * 24 * time.Hour
 
+// SessionKind distinguishes conversation sessions from automation side
+// sessions (cron / timer new_per_run runs). The max_concurrent_sessions cap
+// counts only conversation sessions so background jobs neither consume nor
+// get gated by the human conversation budget.
+type SessionKind int
+
+const (
+	// KindConversation is a user-facing conversation session.
+	KindConversation SessionKind = iota
+	// KindSide is an automation-owned session (cron-/timer- prefixed runs).
+	KindSide
+)
+
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
@@ -56,17 +70,28 @@ type Session struct {
 	// sessions cannot permanently occupy the active slot.
 	ExplicitActivatedAt time.Time `json:"explicit_activated_at,omitempty"`
 
-	mu   sync.Mutex `json:"-"`
-	busy bool       `json:"-"`
+	mu   sync.Mutex  `json:"-"`
+	busy bool        `json:"-"`
+	kind SessionKind `json:"-"`
+	// onBusyChange is injected by the owning SessionManager so TryLock/unlock
+	// can maintain the manager's per-kind busy counters (used by the
+	// max_concurrent_sessions cap). nil for standalone sessions (tests).
+	onBusyChange func(kind SessionKind, delta int32) `json:"-"`
 }
 
 func (s *Session) TryLock() bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.busy {
+		s.mu.Unlock()
 		return false
 	}
 	s.busy = true
+	cb := s.onBusyChange
+	kind := s.kind
+	s.mu.Unlock()
+	if cb != nil {
+		cb(kind, 1)
+	}
 	return true
 }
 
@@ -89,7 +114,13 @@ func (s *Session) UnlockWithoutUpdate() {
 func (s *Session) unlock(update bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.busy {
+		return
+	}
 	s.busy = false
+	if s.onBusyChange != nil {
+		s.onBusyChange(s.kind, -1)
+	}
 	if update {
 		s.UpdatedAt = time.Now()
 	}
@@ -328,12 +359,21 @@ type SessionManager struct {
 	userMeta      map[string]*UserMeta // sessionKey → display info
 	counter       int64
 	storePath     string // empty = no persistence
+	onBusyChange  func(kind SessionKind, delta int32)
 
 	// legacyData is true when sessions were loaded from a snapshot that
 	// predates PastAgentSessionIDs tracking. In this state, many sessions
 	// may have lost their AgentSessionID through /new or provider switches.
 	// KnownAgentSessionIDs returns nil to disable filterOwnedSessions.
 	legacyData bool
+
+	// busyConversation / busySide track how many sessions of each kind are
+	// currently locked, maintained via the onBusyChange callback injected
+	// into every session this manager creates. Lets the
+	// max_concurrent_sessions cap check busy state in O(1) instead of
+	// scanning every session under its mutex.
+	busyConversation atomic.Int32
+	busySide         atomic.Int32
 }
 
 func NewSessionManager(storePath string) *SessionManager {
@@ -345,10 +385,23 @@ func NewSessionManager(storePath string) *SessionManager {
 		userMeta:      make(map[string]*UserMeta),
 		storePath:     storePath,
 	}
+	sm.onBusyChange = func(kind SessionKind, delta int32) {
+		if kind == KindSide {
+			sm.busySide.Add(delta)
+			return
+		}
+		sm.busyConversation.Add(delta)
+	}
 	if storePath != "" {
 		sm.load()
 	}
 	return sm
+}
+
+// BusyConversationCount returns the number of conversation-kind sessions
+// currently locked for an in-flight turn (side/automation sessions excluded).
+func (sm *SessionManager) BusyConversationCount() int {
+	return int(sm.busyConversation.Load())
 }
 
 // StorePath returns the file path used for session persistence.
@@ -386,16 +439,20 @@ func (sm *SessionManager) NewSession(userKey, name string) *Session {
 // NewSideSession registers a new session for userKey without changing the active
 // session. Used for isolated one-off runs (e.g. cron with session_mode=new_per_run)
 // so the user's current chat remains the default target for normal messages.
+// Side sessions are KindSide: they lock/unlock like conversation sessions but
+// do not count toward the max_concurrent_sessions conversation cap.
 func (sm *SessionManager) NewSideSession(userKey, name string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	id := sm.nextID()
 	now := time.Now()
 	s := &Session{
-		ID:        id,
-		Name:      name,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:           id,
+		Name:         name,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		kind:         KindSide,
+		onBusyChange: sm.onBusyChange,
 	}
 	sm.sessions[id] = s
 	sm.userSessions[userKey] = append(sm.userSessions[userKey], id)
@@ -407,10 +464,12 @@ func (sm *SessionManager) createLocked(userKey, name string) *Session {
 	id := sm.nextID()
 	now := time.Now()
 	s := &Session{
-		ID:        id,
-		Name:      name,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:           id,
+		Name:         name,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		kind:         KindConversation,
+		onBusyChange: sm.onBusyChange,
 	}
 	sm.sessions[id] = s
 	sm.activeSession[userKey] = id
@@ -876,7 +935,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

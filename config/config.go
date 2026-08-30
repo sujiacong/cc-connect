@@ -489,6 +489,19 @@ type ProjectConfig struct {
 	// AgentSessionIdleTimeoutMins 在指定分钟数后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下一条消息继续恢复。0 或 nil 表示禁用。
 	AgentSessionIdleTimeoutMins *int `toml:"agent_session_idle_timeout_mins,omitempty"`
+	// MaxConcurrentSessions 限制同时活跃的对话会话数（正在处理消息的会话数）。
+	// 当活跃会话数达到该上限时，新会话的消息将被拒绝并提示稍后重试，不进入 agent；
+	// 已占用（正在对话）的会话不受影响，其后续消息仍按原逻辑排队。
+	// nil 或 <= 0 表示不限制（兼容现有配置）。
+	MaxConcurrentSessions *int `toml:"max_concurrent_sessions,omitempty"`
+	// HelpTitle 覆盖 /help 命令输出的帮助标题（renderHelpText 首行）。未设置时
+	// 使用内置默认文案 "📖 ICG 智能助手帮助"，兼容现有配置。对接其他智能助手时可
+	// 借此定制品牌文案而无需改代码。
+	HelpTitle *string `toml:"help_title,omitempty"`
+	// HelpIntro 覆盖 /help 命令输出的帮助提示语（renderHelpText 的提示语行）。
+	// 未设置时使用内置默认文案
+	// "发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。"，兼容现有配置。
+	HelpIntro *string `toml:"help_intro,omitempty"`
 	// RunAsUser, when set, causes the agent command for this project to be
 	// spawned under a different Unix user via `sudo -n -iu <user> --`. This
 	// provides OS-level file-system isolation from the supervisor user who
@@ -1052,6 +1065,9 @@ func (c *Config) validateInternal(permissive bool) error {
 		}
 		if proj.AgentSessionIdleTimeoutMins != nil && *proj.AgentSessionIdleTimeoutMins < 0 {
 			return fmt.Errorf("config: %s.agent_session_idle_timeout_mins must be >= 0", prefix)
+		}
+		if proj.MaxConcurrentSessions != nil && *proj.MaxConcurrentSessions < 0 {
+			return fmt.Errorf("config: %s.max_concurrent_sessions must be >= 0", prefix)
 		}
 		if err := validateRunAsUser(prefix, proj.RunAsUser); err != nil {
 			return err

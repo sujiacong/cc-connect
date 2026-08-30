@@ -185,12 +185,15 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	var disallowedTools []string
-	if tools, ok := opts["disallowed_tools"].([]any); ok {
+	switch tools := opts["disallowed_tools"].(type) {
+	case []any:
 		for _, t := range tools {
 			if s, ok := t.(string); ok {
 				disallowedTools = append(disallowedTools, s)
 			}
 		}
+	case []string:
+		disallowedTools = append(disallowedTools, tools...)
 	}
 
 	maxContextTokens := 0

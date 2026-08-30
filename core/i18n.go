@@ -413,31 +413,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -544,14 +544,15 @@ const (
 
 	MsgCommandTimeout MsgKey = "command_timeout"
 
-	MsgBannedWordBlocked MsgKey = "banned_word_blocked"
-	MsgCommandDisabled   MsgKey = "command_disabled"
-	MsgAdminRequired     MsgKey = "admin_required"
-	MsgRateLimited       MsgKey = "rate_limited"
-	MsgPsSent            MsgKey = "ps_sent"
-	MsgPsSendFailed      MsgKey = "ps_send_failed"
-	MsgPsEmpty           MsgKey = "ps_empty"
-	MsgPsNoSession       MsgKey = "ps_no_session"
+	MsgBannedWordBlocked      MsgKey = "banned_word_blocked"
+	MsgCommandDisabled        MsgKey = "command_disabled"
+	MsgAdminRequired          MsgKey = "admin_required"
+	MsgRateLimited            MsgKey = "rate_limited"
+	MsgConcurrentSessionLimit MsgKey = "concurrent_session_limit"
+	MsgPsSent                 MsgKey = "ps_sent"
+	MsgPsSendFailed           MsgKey = "ps_send_failed"
+	MsgPsEmpty                MsgKey = "ps_empty"
+	MsgPsNoSession            MsgKey = "ps_no_session"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -688,8 +689,8 @@ const (
 	// send / cron / timer / relay tool documentation in their native
 	// language. Translation coverage is en + zh for this PR; additional
 	// languages fall back to en automatically.
-	MsgAgentSendToolPrompt MsgKey = "agent_send_tool_prompt"
-	MsgAgentCronToolPrompt MsgKey = "agent_cron_tool_prompt"
+	MsgAgentSendToolPrompt  MsgKey = "agent_send_tool_prompt"
+	MsgAgentCronToolPrompt  MsgKey = "agent_cron_tool_prompt"
 	MsgAgentTimerToolPrompt MsgKey = "agent_timer_tool_prompt"
 	MsgAgentRelayToolPrompt MsgKey = "agent_relay_tool_prompt"
 )
@@ -3404,6 +3405,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 訊息發送過快，請稍後再試。",
 		LangJapanese:           "⏳ メッセージの送信が速すぎます。しばらくお待ちください。",
 		LangSpanish:            "⏳ Estás enviando mensajes demasiado rápido. Espera un momento.",
+	},
+	MsgConcurrentSessionLimit: {
+		LangEnglish:            "⏳ The conversation is full right now (max %d people chatting at once). Please try again later.",
+		LangChinese:            "⏳ 当前对话人数已满（最多 %d 人同时对话），请稍后重试。",
+		LangTraditionalChinese: "⏳ 當前對話人數已滿（最多 %d 人同時對話），請稍後重試。",
+		LangJapanese:           "⏳ 現在チャット中の人数が上限（同時 %d 人）に達しています。しばらくしてからお試しください。",
+		LangSpanish:            "⏳ Hay demasiadas personas conversando ahora mismo (máx. %d simultáneas). Inténtalo de nuevo más tarde.",
 	},
 	MsgPsSent: {
 		LangEnglish:            "✅ P.S. delivered.",

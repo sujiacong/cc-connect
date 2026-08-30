@@ -134,6 +134,34 @@ func (r *CommandRegistry) Resolve(name string) (*CustomCommand, bool) {
 	return nil, false
 }
 
+// ResolveByPrefix resolves a command by unique prefix over registered config
+// commands, mirroring builtin matchPrefix semantics so e.g. /bug-a matches
+// bug-analyze. Empty prefixes are rejected (a lone "/" must not resolve the
+// only registered command), hyphens and underscores fold like Resolve, and
+// ambiguous or unmatched prefixes return false. ResolveByPrefix is for
+// dispatch-time completion only — existence checks (e.g. /commands add
+// conflict detection) must use Resolve so exact-name semantics are preserved.
+func (r *CommandRegistry) ResolveByPrefix(name string) (*CustomCommand, bool) {
+	prefix := normalizeCommandName(strings.TrimPrefix(name, "/"))
+	if prefix == "" {
+		return nil, false
+	}
+	var matched *CustomCommand
+	ambiguous := false
+	r.mu.RLock()
+	for key, c := range r.commands {
+		if strings.HasPrefix(normalizeCommandName(key), prefix) {
+			if matched != nil {
+				ambiguous = true
+				break
+			}
+			matched = c
+		}
+	}
+	r.mu.RUnlock()
+	return matched, matched != nil && !ambiguous
+}
+
 // ListAll returns all registered commands (config + agent command files).
 func (r *CommandRegistry) ListAll() []*CustomCommand {
 	r.mu.RLock()

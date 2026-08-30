@@ -189,6 +189,27 @@ level = "info" # debug, info, warn, error
 # [[projects]]
 # agent_session_idle_timeout_mins = 30
 
+# Limit the number of concurrently active conversation sessions (sessions
+# currently busy processing a message) for this project. When the cap is
+# reached, a brand-new conversation is rejected with a "conversation full"
+# notice and the message does NOT enter the agent; sessions already mid-
+# conversation keep queueing follow-ups as usual. nil or <= 0 = unlimited.
+# 限制本项目同时活跃的对话会话数（正在处理消息的会话数）。达到上限时，新对话会被
+# 拒绝并提示"当前对话人数已满"，消息不进入 agent；已占用（正在对话）的会话不受影响，
+# 其后续消息仍按原逻辑排队。不设置或 <= 0 表示不限制。
+# [[projects]]
+# max_concurrent_sessions = 5
+
+# Override the /help plain-text title and intro line for this project. When
+# unset, the built-in defaults are used, so existing configs keep the exact
+# same output. Useful when branding cc-connect for a different assistant:
+# change these strings without touching code.
+# 覆盖本项目 /help 文本帮助的标题和提示语。未设置时使用内置默认文案，现有配置
+# 输出与之前完全一致。对接其他智能助手时可用来自定义品牌文案，无需改代码。
+# [[projects]]
+# help_title = "📖 ICG 智能助手帮助"
+# help_intro = "发送 /new 开启新话题；/stop 停止当前任务；/help 查看本帮助。"
+
 # =============================================================================
 # OS-user isolation via run_as_user (Linux/macOS only)
 # 通过 run_as_user 实现 OS 用户隔离（仅限 Linux/macOS）
