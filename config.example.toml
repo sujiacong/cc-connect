@@ -1486,6 +1486,8 @@ app_secret = "your-feishu-app-secret"
 # api_base = "https://apigw.lx.qianxin.com"  # Qianxin intranet (default); public: https://openapi.lanxin.cn
 # allow_from = "*"                            # Allowed staffIds, comma-separated; personal bot: set to creator staffId
 # share_session_in_channel = false            # Share one agent session among all group users
+# upload_marker_ttl_minutes = 60              # TTL (minutes) of per-session upload markers (<file_download_dir>/.sessions/<sessionKey>.json, one per chat session); stale markers are swept so a previous upload is never reported as current; <=0 disables expiry sweep
+# file_send_allow_dirs = ""                   # Extra directories the agent may deliver files from via {{file:...}} reply markers, comma-separated absolute paths. The download dir (file_download_dir) is always allowed; default empty restricts outgoing files to it so prompt injection cannot upload arbitrary host files (e.g. /etc/shadow) into the chat. Add the agent workspace here when the agent needs to send back files it produced.
 
 # Weixin personal (ilink bot) / 微信个人号（ilink 机器人网关）
 # Same HTTP API as OpenClaw @tencent-weixin/openclaw-weixin: long-poll getUpdates + sendMessage.

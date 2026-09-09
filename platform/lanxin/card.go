@@ -82,12 +82,10 @@ func (p *Platform) ReplyCard(ctx context.Context, rctx any, card *core.Card) err
 }
 
 // sendCardText sends a plain text message (copyable) to the reply target.
+// {{file:...}} markers are honored like in Reply (see replyWithFiles).
 func (p *Platform) sendCardText(rc replyContext, text string) error {
 	if text == "" {
 		return nil
 	}
-	if rc.chatType == "p2p" {
-		return p.sendBotText(rc.target, text)
-	}
-	return p.sendGroupText(rc.target, text, rc.fromUserID)
+	return p.replyWithFiles(rc, text)
 }

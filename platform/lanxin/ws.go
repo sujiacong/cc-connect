@@ -151,8 +151,9 @@ type lanxinEvent struct {
 	MsgID        string
 	IsAtMe       bool
 	SenderName   string
-	CallbackData string   // for approve_card_callback
-	MediaIDs     []string // for file/image/video/voice messages
+	CallbackData string          // for approve_card_callback
+	MediaIDs     []string        // for file/image/video/voice messages
+	Quoted       *quotedMessage  // referenceMsg: the message this one quotes, if any
 }
 
 // parseWSMessage parses raw WS JSON, returning a list of events.
@@ -215,17 +216,33 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 		// extract text content msgData.text.content
 		content := ""
 		var mediaIDs []string
+		msgType := getString(data, "msgType")
 		if msgData, ok := data["msgData"].(map[string]any); ok {
 			if text, ok := msgData["text"].(map[string]any); ok {
 				content, _ = text["content"].(string)
 			}
-			// extract mediaIds for file/image/video/voice messages
-			if media, ok := msgData["file"].(map[string]any); ok {
-				if ids, ok := media["mediaIds"].([]any); ok {
-					for _, id := range ids {
-						if s, ok := id.(string); ok && s != "" {
-							mediaIDs = append(mediaIDs, s)
+			// Extract media ids from the carrier key matching the msgType:
+			// msgData.file / msgData.image / msgData.video / msgData.voice
+			// (aligned with the official lansenger channel plugin). Only
+			// "file" was read before, so image messages were silently
+			// downgraded to empty text. A media carrier may also carry a text
+			// caption (msgData.<kind>.content), which becomes the message
+			// content the agent sees.
+			// Only file/image are ingested: voice/video carriers are parsed for
+			// msgType recognition but carry no ids here, so such messages fall
+			// through to the no-content skip below instead of being downloaded.
+			switch msgType {
+			case "file", "image":
+				if carrier, ok := msgData[msgType].(map[string]any); ok {
+					if ids, ok := carrier["mediaIds"].([]any); ok {
+						for _, id := range ids {
+							if s, ok := id.(string); ok && s != "" {
+								mediaIDs = append(mediaIDs, s)
+							}
 						}
+					}
+					if caption, ok := carrier["content"].(string); ok && content == "" {
+						content = strings.TrimSpace(caption)
 					}
 				}
 			}
@@ -242,6 +259,7 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 			IsAtMe:     isAtMe,
 			SenderName: getString(data, "senderName"),
 			MediaIDs:   mediaIDs,
+			Quoted:     parseQuotedMessage(data["referenceMsg"]),
 		})
 	}
 	return result
@@ -310,21 +328,28 @@ func (p *Platform) handleWSMessage(raw []byte) {
 		// File/media messages: download asynchronously (do not block the WS
 		// read loop, whose 40s read deadline would otherwise expire mid-download),
 		// then reply with saved paths; never route the empty text to the agent.
+		// arrivedAt is taken HERE — in WS read order — so the session marker's
+		// upload timeline reflects the order the user sent the files in, even
+		// when concurrent downloads complete out of order.
 		if len(ev.MediaIDs) > 0 {
-			slog.Info("lanxin: file message received", "user", ev.From, "chatType", ev.ChatType, "msgType", ev.MsgType, "media_ids", ev.MediaIDs)
-			go p.handleFileMessage(ev)
+			slog.Info("lanxin: media message received", "user", ev.From, "chatType", ev.ChatType, "msgType", ev.MsgType, "media_ids", ev.MediaIDs, "has_caption", ev.Content != "")
+			arrivedAt := time.Now().Format(time.RFC3339Nano)
+			// Media with a text caption or a quoted reference (e.g. an image
+			// captioned "看下这个报错", or quoting an earlier picture) goes to the
+			// agent right away with the files injected; caption-less media is
+			// saved and acknowledged, staying available to the session's later
+			// commands (bot-log-analysis intake style).
+			if (ev.Content != "" || ev.Quoted != nil) && (ev.MsgType == "image" || ev.MsgType == "file") {
+				go p.handleMediaWithCaption(ev, arrivedAt)
+			} else {
+				go p.handleFileMessage(ev, arrivedAt)
+			}
 			continue
 		}
 
 		// build session key and replyContext
 		target := replyTarget(ev)
-
-		var sessionKey string
-		if ev.ChatType == "group" && !p.shareSessionInChannel {
-			sessionKey = fmt.Sprintf("lanxin:%s:%s:%s", ev.ChatType, ev.GroupID, ev.From)
-		} else {
-			sessionKey = fmt.Sprintf("lanxin:%s:%s", ev.ChatType, target)
-		}
+		sessionKey := p.sessionKeyForEvent(ev)
 
 		chatName := ""
 		if ev.ChatType == "group" {
@@ -337,6 +362,17 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			// "@ICG智能助手 /help"). Strip it so slash commands are recognized.
 			content = stripMentionPrefix(content)
 		}
+		// If the user quoted an earlier message (referenceMsg), prepend its
+		// context so the agent understands what "这张图/刚才那条/这个报错" refers to.
+		content = p.attachReference(ev, content)
+
+		// Non-text message kinds without any ingestible payload (stickers,
+		// positions, cards, ...) have neither content nor mediaIds; skip them
+		// instead of routing a pointless empty message to the agent.
+		if content == "" && (ev.MsgType == "" || (ev.MsgType != "text" && ev.MsgType != "formatText")) {
+			slog.Debug("lanxin: message kind without content, skipping", "type", ev.MsgType)
+			continue
+		}
 
 		msg := &core.Message{
 			SessionKey: sessionKey,
@@ -346,6 +382,10 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			UserName:   ev.SenderName,
 			ChatName:   chatName,
 			Content:    content,
+			// UploadedFiles is populated inside the handler goroutine below,
+			// AFTER waiting for any same-session media download that is still
+			// in flight, so a text command sent immediately after a large file
+			// upload still carries that file.
 			ReplyCtx: replyContext{
 				chatType:   ev.ChatType,
 				target:     target,
@@ -357,7 +397,20 @@ func (p *Platform) handleWSMessage(raw []byte) {
 		}
 
 		slog.Debug("lanxin: text received", "user", ev.From, "chatType", ev.ChatType, "len", len(ev.Content))
-		go p.handler(p, msg)
+		go func() {
+			// A file message sent moments ago may still be downloading (large
+			// files take seconds; the download itself has a 60s timeout). Wait
+			// for it before reading the session marker. Runs in this worker
+			// goroutine so the WS read loop is never blocked. On timeout the
+			// message proceeds with the current marker state — the download
+			// keeps running and its marker write stays visible to later turns.
+			p.waitSessionUploads(sessionKey, uploadWaitTimeout)
+			// Inject this session's full upload timeline (if any) so the agent
+			// analyzes exactly the files the current session uploaded, without
+			// scanning uploads/ history or another session's files.
+			msg.UploadedFiles = p.sessionUploadedFiles(sessionKey)
+			p.handler(p, msg)
+		}()
 	}
 }
 
@@ -370,20 +423,58 @@ func replyTarget(ev lanxinEvent) string {
 	return ev.From
 }
 
-// handleFileMessage downloads all attached media files and replies with the
-// saved local paths (bot-log-analysis style log-package intake).
-func (p *Platform) handleFileMessage(ev lanxinEvent) {
+// sessionKeyForEvent builds the same session key used for text-message routing
+// (see handleWSMessage) so file uploads are attributed to the session whose
+// commands they belong to:
+//
+//	lanxin:p2p:<from>                  — private chat
+//	lanxin:group:<groupId>             — group with share_session_in_channel
+//	lanxin:group:<groupId>:<from>      — group with per-user sessions
+func (p *Platform) sessionKeyForEvent(ev lanxinEvent) string {
+	if ev.ChatType == "group" && !p.shareSessionInChannel {
+		return fmt.Sprintf("lanxin:%s:%s:%s", ev.ChatType, ev.GroupID, ev.From)
+	}
+	return fmt.Sprintf("lanxin:%s:%s", ev.ChatType, replyTarget(ev))
+}
+
+// downloadSessionMedia downloads every media id of ev and appends each saved
+// file to the sender session's per-session upload marker (cumulative: earlier
+// uploads of the session are kept). Returns the saved local paths. Each
+// saveMedia appends its own record, so a multi-file message contributes all of
+// its files. arrivedAt is the message's WS-arrival timestamp (RFC3339Nano): it
+// timestamps every file of the batch so the marker timeline matches the user's
+// sending order. Runs in a worker goroutine (never the WS read loop).
+func (p *Platform) downloadSessionMedia(ev lanxinEvent, arrivedAt string) []string {
+	sessionKey := p.sessionKeyForEvent(ev)
+	// Register this download as in-flight so a text command sent right after
+	// the media message waits for the download (and its session-marker write)
+	// before reading UploadedFiles. finish runs via defer AFTER saveMedia, so
+	// the marker is always written before waiters are released.
+	uf := p.beginSessionUpload(sessionKey)
+	defer p.finishSessionUpload(sessionKey, uf)
 	var saved []string
 	for _, mid := range ev.MediaIDs {
-		path, err := p.saveMedia(mid)
+		path, err := p.saveMedia(mid, sessionKey, arrivedAt)
 		if err != nil {
 			slog.Warn("lanxin: save media failed", "media_id", mid, "error", err)
 			continue
 		}
 		saved = append(saved, path)
 	}
+	return saved
+}
 
-	reply := "已收到文件"
+// handleFileMessage downloads all attached media (caption-less intake path),
+// appends them to the session marker, and replies with the saved local paths
+// (bot-log-analysis style log-package intake).
+func (p *Platform) handleFileMessage(ev lanxinEvent, arrivedAt string) {
+	saved := p.downloadSessionMedia(ev, arrivedAt)
+
+	kindLabel := "文件"
+	if ev.MsgType == "image" {
+		kindLabel = "图片"
+	}
+	reply := "已收到" + kindLabel
 	if len(saved) > 0 {
 		reply += "，保存到：\n" + strings.Join(saved, "\n")
 	} else {
@@ -392,10 +483,61 @@ func (p *Platform) handleFileMessage(ev lanxinEvent) {
 
 	rc := replyContext{chatType: ev.ChatType, target: replyTarget(ev), senderName: ev.SenderName, fromUserID: ev.From}
 	if err := p.Reply(context.Background(), rc, reply); err != nil {
-		slog.Warn("lanxin: file reply failed", "error", err)
+		slog.Warn("lanxin: media reply failed", "error", err)
 	}
 }
 
+// handleMediaWithCaption downloads media that carries a text caption (e.g. an
+// image captioned "看下这个报错"), then routes the caption to the agent with the
+// downloaded files injected as UploadedFiles — so the bot can answer about the
+// media immediately, without needing a follow-up command. When nothing could
+// be saved (or the caption is only a bare group mention) it falls back to the
+// plain ack path, which reports the download failure.
+func (p *Platform) handleMediaWithCaption(ev lanxinEvent, arrivedAt string) {
+	content := ev.Content
+	if ev.ChatType == "group" {
+		content = stripMentionPrefix(content)
+	}
+	// If the user quoted an earlier message (referenceMsg), prepend its
+	// context — e.g. quoting a previously sent picture while sending a new one.
+	content = p.attachReference(ev, content)
+	if content == "" {
+		p.handleFileMessage(ev, arrivedAt)
+		return
+	}
+	saved := p.downloadSessionMedia(ev, arrivedAt)
+	if len(saved) == 0 {
+		p.handleFileMessage(ev, arrivedAt) // acks the failure
+		return
+	}
+
+	sessionKey := p.sessionKeyForEvent(ev)
+	chatName := ""
+	if ev.ChatType == "group" {
+		chatName = ev.GroupID
+	}
+	msg := &core.Message{
+		SessionKey: sessionKey,
+		Platform:   platformName,
+		MessageID:  ev.MsgID,
+		UserID:     ev.From,
+		UserName:   ev.SenderName,
+		ChatName:   chatName,
+		Content:    content,
+		// Downloads finished synchronously above, so the session marker
+		// already holds this batch — inject it so the agent sees the files.
+		UploadedFiles: p.sessionUploadedFiles(sessionKey),
+		ReplyCtx: replyContext{
+			chatType:   ev.ChatType,
+			target:     replyTarget(ev),
+			senderName: ev.SenderName,
+			msgID:      ev.MsgID,
+			proactive:  false,
+			fromUserID: ev.From,
+		},
+	}
+	p.handler(p, msg)
+}
 
 // stripMentionPrefix removes a leading "@botname " mention segment from a
 // group-chat message. Lanxin pushes group messages as "@botname <text>"; the
