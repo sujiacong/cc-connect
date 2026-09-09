@@ -540,6 +540,7 @@ type queuedMessage struct {
 	content           string
 	images            []ImageAttachment
 	files             []FileAttachment
+	uploadedFiles     []UploadedFile // session upload timeline; nil = platform does not track uploads
 	fromVoice         bool
 	userID            string
 	userName          string // sender's display name for sender injection
@@ -547,6 +548,18 @@ type queuedMessage struct {
 	msgSessionKey     string // session key for extracting chat ID
 	channelKey        string // platform-provided channel identifier (preferred over sessionKey extraction)
 	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
+}
+
+// withUploadBlock prepends the per-session upload block to a prompt when the
+// platform attributed uploads to the message (UploadedFiles != nil). Used by
+// every prompt-build site (direct turn + both queued-message drains) so the
+// injection covers all routing paths. nil → no injection; empty list → the
+// explicit "no upload this time" note.
+func (e *Engine) withUploadBlock(prompt string, files []UploadedFile) string {
+	if files == nil {
+		return prompt
+	}
+	return UploadedFilesBlock(files) + "\n\n" + prompt
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -3295,6 +3308,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		content:           msg.Content,
 		images:            msg.Images,
 		files:             msg.Files,
+		uploadedFiles:     msg.UploadedFiles,
 		fromVoice:         msg.FromVoice,
 		userID:            msg.UserID,
 		userName:          msg.UserName,
@@ -3910,6 +3924,12 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+
+	// Engine-level upload injection: when the platform attributed a per-session
+	// upload to this message (Message.UploadedFiles != nil), prepend the file
+	// list so the agent analyzes exactly this session's files. nil (other
+	// platforms) → no injection; empty list → explicit "no upload this time".
+	promptContent = e.withUploadBlock(promptContent, msg.UploadedFiles)
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -6202,7 +6222,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
-				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+				queuedPrompt := e.withUploadBlock(e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey), queued.uploadedFiles)
 
 				state.mu.Lock()
 				as := state.agentSession // capture under lock to avoid race with cleanup
@@ -6521,7 +6541,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
-		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+		prompt := e.withUploadBlock(e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey), queued.uploadedFiles)
 
 		state.mu.Lock()
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)

@@ -16235,3 +16235,209 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
 	}
 }
+
+// TestProcessInteractiveMessageWith_InjectsUploadedFiles verifies that a
+// message carrying Message.UploadedFiles gets the file list injected into the
+// agent prompt (engine-level upload injection), before the user content.
+func TestProcessInteractiveMessageWith_InjectsUploadedFiles(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	newAgentSession := newResultAgentSession("done")
+	e := NewEngine("test", &resultAgent{session: newAgentSession}, []Platform{p}, "", LangEnglish)
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey:    "lanxin:p2p:user1",
+		Platform:      "lanxin",
+		MessageID:     "msg-1",
+		UserID:        "user1",
+		UserName:      "Alice",
+		Content:       "分析",
+		UploadedFiles: []UploadedFile{{Path: "/root/icg-ai-bot/uploads/m1.log", OriginalName: "m1.log", UploadedAt: "2026-08-30T20:00:00+08:00"}},
+		ReplyCtx:      "rc",
+	})
+
+	if got := waitForPlatformSend(p, 1, 3*time.Second); len(got) == 0 || got[0] != "done" {
+		t.Fatalf("platform sent = %v, want [done]", got)
+	}
+	if len(newAgentSession.sentPrompts) != 1 {
+		t.Fatalf("agent prompts = %d, want 1", len(newAgentSession.sentPrompts))
+	}
+	prompt := newAgentSession.sentPrompts[0]
+	if !strings.Contains(prompt, "【本次上传文件") {
+		t.Errorf("prompt missing upload block header: %q", prompt)
+	}
+	if !strings.Contains(prompt, "/root/icg-ai-bot/uploads/m1.log") {
+		t.Errorf("prompt missing injected file path: %q", prompt)
+	}
+	if !strings.Contains(prompt, "分析") {
+		t.Errorf("prompt missing user content: %q", prompt)
+	}
+	// the injection must not be re-injected into history (raw content stays clean)
+	if h := e.sessions.GetOrCreateActive("lanxin:p2p:user1").GetHistory(2); len(h) != 2 || h[0].Role != "user" || !strings.Contains(h[0].Content, "分析") {
+		t.Errorf("history = %#v, want raw user content without injection", h)
+	}
+}
+
+// TestProcessInteractiveMessageWith_EmptyUploadedFilesInjectsNoUploadNote
+// verifies a lanxin session with no upload gets the "no upload" note injected.
+func TestProcessInteractiveMessageWith_EmptyUploadedFilesInjectsNoUploadNote(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	newAgentSession := newResultAgentSession("done")
+	e := NewEngine("test", &resultAgent{session: newAgentSession}, []Platform{p}, "", LangEnglish)
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey:    "lanxin:p2p:user1",
+		Platform:      "lanxin",
+		MessageID:     "msg-2",
+		UserID:        "user1",
+		Content:       "分析",
+		UploadedFiles: []UploadedFile{},
+		ReplyCtx:      "rc",
+	})
+
+	if got := waitForPlatformSend(p, 1, 3*time.Second); len(got) == 0 || got[0] != "done" {
+		t.Fatalf("platform sent = %v, want [done]", got)
+	}
+	if len(newAgentSession.sentPrompts) != 1 {
+		t.Fatalf("agent prompts = %d, want 1", len(newAgentSession.sentPrompts))
+	}
+	if !strings.Contains(newAgentSession.sentPrompts[0], "本会话未从蓝信上传过文件") {
+		t.Errorf("prompt missing no-upload note: %q", newAgentSession.sentPrompts[0])
+	}
+}
+
+// TestProcessInteractiveMessageWith_NilUploadedFilesSkipsInjection verifies
+// platforms that do not track uploads (UploadedFiles == nil) get no injection.
+func TestProcessInteractiveMessageWith_NilUploadedFilesSkipsInjection(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	newAgentSession := newResultAgentSession("done")
+	e := NewEngine("test", &resultAgent{session: newAgentSession}, []Platform{p}, "", LangEnglish)
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey: "feishu:oc_1:user1",
+		Platform:   "feishu",
+		MessageID:  "msg-3",
+		UserID:     "user1",
+		Content:    "hello",
+		ReplyCtx:   "rc",
+	})
+
+	if got := waitForPlatformSend(p, 1, 3*time.Second); len(got) == 0 || got[0] != "done" {
+		t.Fatalf("platform sent = %v, want [done]", got)
+	}
+	if len(newAgentSession.sentPrompts) != 1 {
+		t.Fatalf("agent prompts = %d, want 1", len(newAgentSession.sentPrompts))
+	}
+	if strings.Contains(newAgentSession.sentPrompts[0], "本次上传文件") {
+		t.Errorf("non-lanxin prompt must not contain upload block: %q", newAgentSession.sentPrompts[0])
+	}
+}
+
+// TestQueuedMessage_KeepsUploadedFilesInjection verifies that a lanxin message
+// queued behind a busy turn still gets the per-session upload block injected
+// when the drain loop runs it (regression: the injection used to exist only in
+// processInteractiveMessageWith, so queued turns silently lost the upload
+// timeline AND the "only these files" guard).
+func TestQueuedMessage_KeepsUploadedFilesInjection(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs-upload")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "lanxin:p2p:user1"
+
+	// Turn A occupies the session; message B (with UploadedFiles) is queued
+	// behind it. The producer gates each turn's result events on the engine
+	// having reached the next Send, mirroring TestIssue814's flow.
+	go func() {
+		// Wait for A's Send call.
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) < 1 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+
+		// Wait until B has been queued behind A.
+		for {
+			e.interactiveMu.Lock()
+			st, ok := e.interactiveStates[key]
+			e.interactiveMu.Unlock()
+			if ok && st != nil {
+				st.mu.Lock()
+				n := len(st.pendingMessages)
+				st.mu.Unlock()
+				if n >= 1 {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// Finish turn A.
+		sess.events <- Event{Type: EventResult, Content: "response-A", Done: true}
+
+		// Wait for B's Send (the queued turn), then finish it.
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) < 2 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+		sess.events <- Event{Type: EventResult, Content: "response-B", Done: true}
+	}()
+
+	// A: occupies the session.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key,
+		Platform:   "lanxin",
+		UserID:     "user1",
+		MessageID:  "msg-A",
+		Content:    "第一轮",
+		ReplyCtx:   "ctx-A",
+	})
+
+	// Wait until A's foreground turn is inside the event loop before
+	// dispatching B, so B lands in the busy-session queue.
+	time.Sleep(50 * time.Millisecond)
+	e.ReceiveMessage(p, &Message{
+		SessionKey:    key,
+		Platform:      "lanxin",
+		UserID:        "user1",
+		MessageID:     "msg-B",
+		Content:       "分析",
+		ReplyCtx:      "ctx-B",
+		UploadedFiles: []UploadedFile{{Path: "/root/icg-ai-bot/uploads/m1.log", OriginalName: "m1.log", UploadedAt: "2026-08-30T20:00:00+08:00"}},
+	})
+
+	// Wait for turn B's reply.
+	deadline := time.After(5 * time.Second)
+	for {
+		if got := p.getSent(); len(got) >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for queued turn reply; sent=%v", p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	sess.sendMu.Lock()
+	defer sess.sendMu.Unlock()
+	if len(sess.sendCalls) < 2 {
+		t.Fatalf("agent sendCalls = %d, want 2", len(sess.sendCalls))
+	}
+	queuedPrompt := sess.sendCalls[1]
+	if !strings.Contains(queuedPrompt, "【本次上传文件") {
+		t.Errorf("queued prompt missing upload block: %q", queuedPrompt)
+	}
+	if !strings.Contains(queuedPrompt, "/root/icg-ai-bot/uploads/m1.log") {
+		t.Errorf("queued prompt missing injected file path: %q", queuedPrompt)
+	}
+	if !strings.Contains(queuedPrompt, "分析") {
+		t.Errorf("queued prompt missing user content: %q", queuedPrompt)
+	}
+}

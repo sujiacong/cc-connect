@@ -92,6 +92,18 @@ func AllowList(allowFrom, userID string) bool {
 	return false
 }
 
+// UploadedFile is one file a session uploaded through the platform (e.g.
+// lanxin's per-session upload markers under uploads/.sessions/). Compared with
+// a bare path it also carries the original file name (as the user named it on
+// their side, GBK-decoded when needed) and the upload timestamp, so the agent
+// can correlate "the file I just sent" with the actual saved path and tell
+// earlier uploads apart from later ones.
+type UploadedFile struct {
+	Path         string `json:"path"`          // absolute path of the saved media file
+	OriginalName string `json:"original_name"` // original file name from the platform, falls back to mediaID
+	UploadedAt   string `json:"uploaded_at"`   // RFC3339, e.g. 2026-08-30T20:00:00+08:00
+}
+
 // ImageAttachment represents an image sent by the user.
 type ImageAttachment struct {
 	MimeType string // e.g. "image/png", "image/jpeg"
@@ -405,22 +417,32 @@ type LocationAttachment struct {
 
 // Message represents a unified incoming message from any platform.
 type Message struct {
-	SessionKey   string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
-	Platform     string
-	MessageID    string // platform message ID for tracing
-	Recalled     bool   // true for platform message recall/delete events targeting MessageID
-	ChannelID    string
-	UserID       string
-	UserName     string
-	ChatName     string // human-readable chat/group name (optional)
-	Content      string
-	Images       []ImageAttachment   // attached images (if any)
-	Files        []FileAttachment    // attached files (if any)
-	Audio        *AudioAttachment    // voice message (if any)
-	Location     *LocationAttachment // geographical location (if any)
-	ExtraContent string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent
-	OnAccepted   func()              // called once when the engine accepts this message for an agent turn
-	ChannelKey   string              // platform-provided channel identifier for workspace binding (optional)
+	SessionKey string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
+	Platform   string
+	MessageID  string // platform message ID for tracing
+	Recalled   bool   // true for platform message recall/delete events targeting MessageID
+	ChannelID  string
+	UserID     string
+	UserName   string
+	ChatName   string // human-readable chat/group name (optional)
+	Content    string
+	Images     []ImageAttachment // attached images (if any)
+	Files      []FileAttachment  // attached files (if any)
+	// UploadedFiles lists all files this session has uploaded through the
+	// platform and that are still within the upload-marker TTL (e.g. lanxin's
+	// per-session upload markers under uploads/.sessions/). The platform layer
+	// populates it when a text command arrives so the engine can inject the
+	// timeline into the agent input — the agent analyzes exactly these files,
+	// with original names and upload timestamps to correlate against the
+	// conversation, without scanning uploads/ history or another session's
+	// files. nil means the platform does not participate in upload tracking (no
+	// injection); a non-nil empty slice means "session, but no upload this time".
+	UploadedFiles []UploadedFile
+	Audio         *AudioAttachment    // voice message (if any)
+	Location      *LocationAttachment // geographical location (if any)
+	ExtraContent  string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent
+	OnAccepted    func()              // called once when the engine accepts this message for an agent turn
+	ChannelKey    string              // platform-provided channel identifier for workspace binding (optional)
 	// LegacyChannelKey is the platform-provided channel identifier used by an
 	// older workspace-binding scope. When both keys are set, multi-workspace
 	// routing atomically migrates the legacy binding to ChannelKey.
