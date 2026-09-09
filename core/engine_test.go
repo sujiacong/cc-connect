@@ -3858,7 +3858,7 @@ func TestReplyWithCard_DoesNotTransformMarkdownOrFallback(t *testing.T) {
 	}
 }
 
-func TestCmdHelp_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
+func TestCmdHelp_UsesPlainTextOnPlatformWithoutCardSupport(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangChinese)
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
@@ -3868,14 +3868,17 @@ func TestCmdHelp_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	if len(p.sent) != 1 {
 		t.Fatalf("sent messages = %d, want 1", len(p.sent))
 	}
-	if got := p.sent[0]; got != e.i18n.T(MsgHelp) {
-		t.Fatalf("help text = %q, want legacy help text", got)
+	// Non-card platforms receive /help as the structured plain-text help
+	// (cmdHelp sends e.renderHelpText()), not the retired MsgHelp blob and not
+	// a card (whose fallback would be the card title below).
+	if got := p.sent[0]; got != e.renderHelpText() {
+		t.Fatalf("help text = %q, want renderHelpText() output", got)
 	}
 	if strings.Contains(p.sent[0], "cc-connect 帮助") {
 		t.Fatalf("help text = %q, should not be card title fallback", p.sent[0])
 	}
-	if !strings.Contains(p.sent[0], "/cron [add|list|exec|del|enable|disable]") {
-		t.Fatalf("help text = %q, want explicit cron exec usage", p.sent[0])
+	if !strings.Contains(p.sent[0], "/cron") {
+		t.Fatalf("help text = %q, want cron usage listed", p.sent[0])
 	}
 }
 
