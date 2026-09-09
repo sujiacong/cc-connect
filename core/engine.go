@@ -4069,10 +4069,17 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 		}
 	}
 
-	// Create per-workspace session manager
+	// Create per-workspace session manager. It persists alongside the main
+	// session store; when the main store path is empty (session persistence
+	// disabled) the workspace manager stays in-memory too — otherwise the
+	// derived relative path would make it write "{name}_ws_*.json" into the
+	// process working directory (e.g. core/test_ws_*.json under `go test`).
 	h := sha256.Sum256([]byte(workspace))
-	sessionFile := filepath.Join(filepath.Dir(e.sessions.StorePath()),
-		fmt.Sprintf("%s_ws_%s.json", e.name, hex.EncodeToString(h[:4])))
+	sessionFile := ""
+	if sp := e.sessions.StorePath(); sp != "" {
+		sessionFile = filepath.Join(filepath.Dir(sp),
+			fmt.Sprintf("%s_ws_%s.json", e.name, hex.EncodeToString(h[:4])))
+	}
 	sessions := NewSessionManager(sessionFile)
 
 	ws.agent = agent

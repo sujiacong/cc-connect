@@ -80,6 +80,9 @@ temp/
 *.swo
 *~
 *.pid
+# Per-workspace session snapshots leaked into the package dir by tests whose
+# engine has an empty session store path (engine name + sha256 of workspace).
+/core/test_ws_*.json
 *.log
 
 # ============================================================================
