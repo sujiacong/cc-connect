@@ -407,6 +407,8 @@ type reqRecorder struct {
 	bots        []string
 	groups      []string
 	uploadNames []string
+	cardUpdates []string // /v1/messages/dynamic/update bodies
+	revokes     []string // /v1/messages/revoke bodies
 }
 
 func (r *reqRecorder) add(p string) {
@@ -445,6 +447,18 @@ func (r *reqRecorder) uploadedNames() []string {
 	return append([]string(nil), r.uploadNames...)
 }
 
+func (r *reqRecorder) cardUpdateBodies() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.cardUpdates...)
+}
+
+func (r *reqRecorder) revokeBodies() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.revokes...)
+}
+
 // newTestPlatformWithServer wires a Platform to an httptest server that
 // answers token/bot/group/media endpoints and records what was requested. The
 // media response carries no Content-Disposition, so saveMedia falls back to the
@@ -479,12 +493,26 @@ func newTestPlatformWithServerDelay(t *testing.T, allowFrom string, contentDispo
 			rec.bots = append(rec.bots, string(b))
 			rec.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{}}`))
+			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{"msgId":"m-card"}}`))
 		case groupMsgPath:
 			b, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()
 			rec.group = string(b)
 			rec.groups = append(rec.groups, string(b))
+			rec.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{"msgId":"m-card"}}`))
+		case dynamicUpdatePath:
+			b, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			rec.cardUpdates = append(rec.cardUpdates, string(b))
+			rec.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{}}`))
+		case revokeMessagePath:
+			b, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			rec.revokes = append(rec.revokes, string(b))
 			rec.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{}}`))
@@ -2088,5 +2116,157 @@ func TestSendReplyText_TrimsBlankEdges(t *testing.T) {
 	}
 	if got, _ := ft["text"].(string); got != "结论" {
 		t.Errorf("text = %q, want 结论 (blank edges trimmed)", got)
+	}
+}
+
+// --- progress card (dynamic appCard) style ---
+
+func TestMilestoneCardLabel_Map(t *testing.T) {
+	cases := []struct{ tool, want string }{
+		{"mcp__jira-qax__jira_search", "正在查询 Jira…"},
+		{"mcp__wiki-qax__confluence_search", "正在检索知识库…"},
+		{"Bash", "正在执行分析…"},
+		{"Read", "正在检索资料…"},
+		{"TaskList", ""},
+	}
+	for _, c := range cases {
+		if got := milestoneCardLabel(core.ToolActivity{ToolName: c.tool}); got != c.want {
+			t.Errorf("milestoneCardLabel(%q) = %q, want %q", c.tool, got, c.want)
+		}
+		if len(c.want) > 30 {
+			t.Errorf("card label %q exceeds the 30-byte status budget", c.want)
+		}
+	}
+}
+
+// waitForCond polls until cond is true or the timeout expires.
+func waitForCond(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestProgressCard_LifecycleCreatesUpdatesFinalizes covers the card style end
+// to end: first stage creates a dynamic appCard, a stage change updates its
+// header status, and turn end finalises it (isLastUpdate) WITHOUT withdrawing
+// it — a recall shows a visible hint to everyone in the chat.
+func TestProgressCard_LifecycleCreatesUpdatesFinalizes(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	p.milestonesEnabled = true
+	p.milestonesStyle = "card"
+	p.milestones = &milestoneTracker{state: map[string]*milestoneState{}}
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	ctx := context.Background()
+
+	// 1) first stage → a dynamic appCard is created
+	if err := p.OnToolActivity(ctx, rc, core.ToolActivity{Starting: true, ToolName: "mcp__jira-qax__jira_search"}); err != nil {
+		t.Fatalf("OnToolActivity: %v", err)
+	}
+	waitForCond(t, 2*time.Second, "card create", func() bool { return len(rec.botBodies()) >= 1 })
+	card := decodeJSONBody(t, rec.botBodies()[0])
+	cardData, _ := card["msgData"].(map[string]any)["appCard"].(map[string]any)
+	if isDyn, _ := cardData["isDynamic"].(bool); !isDyn {
+		t.Errorf("card should be isDynamic, got %v", card["msgData"])
+	}
+	status, _ := cardData["headStatusInfo"].(map[string]any)
+	statusDesc, _ := status["description"].(string)
+	if !strings.Contains(statusDesc, "正在查询 Jira") {
+		t.Errorf("card status = %v, want it to contain 正在查询 Jira", statusDesc)
+	}
+
+	// 2) stage change → header status update
+	if err := p.OnToolActivity(ctx, rc, core.ToolActivity{Starting: true, ToolName: "Bash"}); err != nil {
+		t.Fatalf("OnToolActivity: %v", err)
+	}
+	waitForCond(t, 2*time.Second, "card update", func() bool { return len(rec.cardUpdateBodies()) >= 1 })
+	upd := decodeJSONBody(t, rec.cardUpdateBodies()[0])
+	if upd["msgId"] != "m-card" {
+		t.Errorf("update msgId = %v, want m-card", upd["msgId"])
+	}
+	updData, _ := upd["msgData"].(map[string]any)["appCardUpdateMsg"].(map[string]any)
+	updStatus, _ := updData["headStatusInfo"].(map[string]any)
+	updDesc, _ := updStatus["description"].(string)
+	if !strings.Contains(updDesc, "正在执行分析") {
+		t.Errorf("updated status = %v, want it to contain 正在执行分析", updDesc)
+	}
+
+	// 3) turn end → finalize, and never revoke
+	if err := p.OnTurnEnd(ctx, rc, true); err != nil {
+		t.Fatalf("OnTurnEnd: %v", err)
+	}
+	waitForCond(t, 2*time.Second, "card finalize", func() bool {
+		ups := rec.cardUpdateBodies()
+		if len(ups) < 2 {
+			return false
+		}
+		last := decodeJSONBody(t, ups[len(ups)-1])
+		d, _ := last["msgData"].(map[string]any)["appCardUpdateMsg"].(map[string]any)
+		b, _ := d["isLastUpdate"].(bool)
+		return b
+	})
+	// The card stays in the chat: withdrawing it would broadcast a recall hint.
+	time.Sleep(120 * time.Millisecond)
+	if got := rec.revokeBodies(); len(got) != 0 {
+		t.Errorf("progress card must not be revoked, got %v", got)
+	}
+}
+
+// TestOnTurnEnd_NoCardDoesNothing verifies a turn that never created a card
+// (e.g. a short answer with no tool calls) sends no request at all.
+func TestOnTurnEnd_NoCardDoesNothing(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	p.milestonesEnabled = true
+	p.milestonesStyle = "card"
+	p.milestones = &milestoneTracker{state: map[string]*milestoneState{}}
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	if err := p.OnTurnEnd(context.Background(), rc, true); err != nil {
+		t.Fatalf("OnTurnEnd: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if got := rec.revokeBodies(); len(got) != 0 {
+		t.Errorf("no card -> no revoke, got %v", got)
+	}
+}
+
+// TestProgressCard_TurnStartCreatesCardImmediately verifies the card is created
+// at turn start (as fast as the old instant reply) instead of waiting for the
+// first tool call, and that a following tool event updates that same card
+// rather than creating a second one.
+func TestProgressCard_TurnStartCreatesCardImmediately(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	p.milestonesEnabled = true
+	p.milestonesStyle = "card"
+	p.milestones = &milestoneTracker{state: map[string]*milestoneState{}}
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	ctx := context.Background()
+
+	if err := p.OnTurnStart(ctx, rc); err != nil {
+		t.Fatalf("OnTurnStart: %v", err)
+	}
+	waitForCond(t, 2*time.Second, "card create at turn start", func() bool { return len(rec.botBodies()) >= 1 })
+	card := decodeJSONBody(t, rec.botBodies()[0])
+	cardData, _ := card["msgData"].(map[string]any)["appCard"].(map[string]any)
+	status, _ := cardData["headStatusInfo"].(map[string]any)
+	statusDesc, _ := status["description"].(string)
+	if !strings.Contains(statusDesc, progressCardStartingText) {
+		t.Errorf("initial status = %v, want it to contain %v", statusDesc, progressCardStartingText)
+	}
+
+	// A tool event right after must update that card, not create another.
+	if err := p.OnToolActivity(ctx, rc, core.ToolActivity{Starting: true, ToolName: "mcp__jira-qax__jira_search"}); err != nil {
+		t.Fatalf("OnToolActivity: %v", err)
+	}
+	waitForCond(t, 2*time.Second, "card update", func() bool { return len(rec.cardUpdateBodies()) >= 1 })
+	time.Sleep(120 * time.Millisecond)
+	if got := rec.botBodies(); len(got) != 1 {
+		t.Errorf("exactly one card should be created, got %d", len(got))
 	}
 }

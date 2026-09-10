@@ -66,11 +66,16 @@ type Platform struct {
 	// Checked by replyWithFiles before any upload so a prompt injection cannot
 	// exfiltrate arbitrary host files into the chat.
 	fileSendAllowDirs []string
-	// milestonesEnabled toggles coarse progress milestone messages while the
-	// agent works (core.ToolActivityListener); milestones holds per-chat
-	// throttle state keeping those lines sparse.
+	// milestonesEnabled toggles coarse progress feedback while the agent works
+	// (core.ToolActivityListener); milestones holds per-chat throttle/card
+	// state. milestonesStyle is "text" (sparse stage lines) or "card" (one
+	// dynamic appCard withdrawn at turn end).
 	milestonesEnabled bool
+	milestonesStyle   string
 	milestones        *milestoneTracker
+	// botSenderID is this bot's id inside a group, required by the message
+	// revoke API for group chats (bot_sender_id platform option).
+	botSenderID string
 }
 
 // replyContext holds the context needed to reply to a specific message or to
@@ -136,6 +141,11 @@ func New(opts map[string]any) (core.Platform, error) {
 	slog.Warn("lanxin: personal bot mode — private chat only receives creator messages")
 
 	milestones, _ := opts["milestones"].(bool)
+	milestonesStyle, _ := opts["milestones_style"].(string)
+	if milestonesStyle == "" {
+		milestonesStyle = "text"
+	}
+	botSenderID, _ := opts["bot_sender_id"].(string)
 
 	return &Platform{
 		appID:                 appID,
@@ -148,7 +158,9 @@ func New(opts map[string]any) (core.Platform, error) {
 		uploadMarkerTTL:       uploadMarkerTTL,
 		fileSendAllowDirs:     allowDirs,
 		milestonesEnabled:     milestones,
+		milestonesStyle:       milestonesStyle,
 		milestones:            &milestoneTracker{state: map[string]*milestoneState{}},
+		botSenderID:           botSenderID,
 	}, nil
 }
 

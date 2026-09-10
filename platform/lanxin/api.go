@@ -672,43 +672,54 @@ func (p *Platform) expireUploadMarkerIfStale() {
 
 // postAPI is the shared POST helper for sendBotText/sendGroupText.
 func (p *Platform) postAPI(path string, token string, payload map[string]any, opName string) error {
+	_, err := p.postAPIRaw(path, token, payload, opName)
+	return err
+}
+
+// postAPIRaw is postAPI plus the response's data.msgId — needed by callers
+// that must keep a handle on the message they just sent (e.g. dynamic appCard
+// updates / revoke).
+func (p *Platform) postAPIRaw(path string, token string, payload map[string]any, opName string) (string, error) {
 	u := p.apiBase + path + "?app_token=" + token
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("lanxin: %s: marshal: %w", opName, err)
+		return "", fmt.Errorf("lanxin: %s: marshal: %w", opName, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return fmt.Errorf("lanxin: %s: create request: %w", opName, err)
+		return "", fmt.Errorf("lanxin: %s: create request: %w", opName, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("lanxin: %s: do request: %w", opName, err)
+		return "", fmt.Errorf("lanxin: %s: do request: %w", opName, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("lanxin: %s: status %d: %s", opName, resp.StatusCode, core.RedactToken(string(body), token))
+		return "", fmt.Errorf("lanxin: %s: status %d: %s", opName, resp.StatusCode, core.RedactToken(string(body), token))
 	}
 
 	var result struct {
 		ErrCode int    `json:"errCode"`
 		ErrMsg  string `json:"errMsg"`
+		Data    struct {
+			MsgID string `json:"msgId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("lanxin: %s: decode: %w", opName, err)
+		return "", fmt.Errorf("lanxin: %s: decode: %w", opName, err)
 	}
 
 	if result.ErrCode != 0 {
 		slog.Warn("lanxin: API error", "op", opName, "errCode", result.ErrCode, "errMsg", result.ErrMsg)
-		return fmt.Errorf("lanxin: %s: errCode=%d errMsg=%s", opName, result.ErrCode, result.ErrMsg)
+		return "", fmt.Errorf("lanxin: %s: errCode=%d errMsg=%s", opName, result.ErrCode, result.ErrMsg)
 	}
 
-	return nil
+	return result.Data.MsgID, nil
 }

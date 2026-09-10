@@ -10,50 +10,106 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
-// Milestone progress lines: the platform implements core.ToolActivityListener
-// to surface coarse "正在查询 Jira… / 正在检索知识库…" progress while the agent
-// works. Core broadcasts tool start/finish BEFORE its display-mode gating, so
-// a quiet session still gets lightweight progress without re-enabling the raw
-// thinking/tool text the display settings intentionally hide.
+// Progress feedback while the agent works. Two styles, selected by the
+// `milestones` platform option:
+//
+//	milestones = true                    → text style: sparse stage lines
+//	milestones = true + style = "card"   → card style: one dynamic appCard whose
+//	                                       header status follows the stage and is
+//	                                       finalised (kept, not withdrawn) at the
+//	                                       end of the turn
+//
+// Both are driven by core.ToolActivityListener (tool start/finish broadcast
+// before display-mode gating) plus core.TurnLifecycleListener (turn end), so a
+// quiet session still gets coarse progress without re-enabling thinking text.
 
 const (
 	// milestoneStageIdleReset: when no stage line was sent for this long, the
-	// next tool start is treated as a fresh stage even if the label matches the
-	// last one — otherwise the first milestone of a later turn (same stage as
-	// the previous turn) would be wrongly suppressed.
-	milestoneStageIdleReset = 90 * time.Second
-	milestoneFailedCooldown = 30 * time.Second
+	// next tool start is treated as a fresh stage even if the label matches —
+	// otherwise the first milestone of a later turn (same stage as the previous
+	// turn) would be wrongly suppressed.
+	milestoneStageIdleReset    = 90 * time.Second
+	milestoneFailedCooldown    = 30 * time.Second
 	milestonePersistentTimeout = 5 * time.Minute // drop idle tracker state
+
+	// progress card copy. bodyContent may contain simple HTML — <b> renders
+	// (verified), while the header status field does not support bold.
+	progressCardHeadTitle    = "ICG 智能助手"
+	progressCardBodyTitle    = "处理进度"
+	progressCardBody         = "<b>正在检索资料并分析</b>，请稍候…"
+	progressCardDoneText     = "已完成"
+	progressCardFailText     = "已中断"
+	progressCardStartingText = "正在处理…"
 )
 
-// milestoneState tracks the currently announced stage per reply target. The
-// rule is "announce on stage change": a tool whose coarse stage label equals
-// the last announced one is NOT re-announced (so 5 consecutive Bash calls send
-// one line, not five), and only a stage switch produces a new line.
+// milestoneState tracks the current stage (and, in card style, the live card)
+// for one reply target.
 type milestoneState struct {
 	lastLabel string // last announced stage label; "" = none yet
 	lastAt    time.Time
 	failedAt  time.Time
 	updatedAt time.Time
+
+	// card style state.
+	cardMsgID   string       // msgId of the live progress card ("" = none)
+	cardPending bool         // a create op is queued/running (msgId not known yet)
+	cardRC      replyContext // reply target used when the card was created
+	queue       []cardOp     // serialized card operations (protected by tracker mu)
+	draining    bool         // a worker is draining the queue
 }
 
-// milestoneTracker holds per-target throttling state for milestone messages.
+// cardOp is one queued progress-card operation; ops run strictly in order on a
+// per-target worker so create→update→finalise never race.
+type cardOp struct {
+	kind  string // "create" | "update" | "finalize"
+	label string
+	ok    bool
+}
+
+// milestoneTracker holds per-target throttling/card state.
 type milestoneTracker struct {
 	mu    sync.Mutex
 	state map[string]*milestoneState
 }
 
-// OnToolActivity implements core.ToolActivityListener: coarse tool lifecycle
-// events become short, throttled milestone messages, so the user sees the
-// agent making progress instead of silence until the final answer. Tool names
-// are mapped to friendly stage labels; fine-grained tools are skipped and
-// repeated stages never flood the chat.
+// OnTurnStart implements core.TurnStartListener: in card style the progress
+// card is created the moment the turn begins, so it shows up as fast as an
+// instant reply would — instead of waiting for the first tool call (which can
+// be tens of seconds after the agent starts thinking).
+func (p *Platform) OnTurnStart(ctx context.Context, replyCtx any) error {
+	rc, ok := replyCtx.(replyContext)
+	if !ok || rc.target == "" || !p.milestonesEnabled || p.milestonesStyle != "card" {
+		return nil
+	}
+	key := rc.chatType + ":" + rc.target
+
+	p.milestones.mu.Lock()
+	defer p.milestones.mu.Unlock()
+	ts := p.milestones.state[key]
+	if ts == nil {
+		ts = &milestoneState{}
+		p.milestones.state[key] = ts
+	}
+	ts.updatedAt = time.Now()
+	if ts.cardMsgID != "" || ts.cardPending {
+		return nil // a card already exists (or is being created) for this turn
+	}
+	ts.cardRC = rc
+	ts.cardPending = true
+	ts.queue = append(ts.queue, cardOp{kind: "create", label: progressCardStartingText})
+	p.startCardDrainLocked(key, ts)
+	return nil
+}
+
+// OnToolActivity implements core.ToolActivityListener: it turns coarse tool
+// lifecycle events into progress feedback (text stage lines, or a single
+// dynamic appCard whose header follows the stage). Runs before the engine's
+// display-mode gating, so a quiet session still sees progress.
 func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity core.ToolActivity) error {
 	rc, ok := replyCtx.(replyContext)
 	if !ok || rc.target == "" || !p.milestonesEnabled {
 		return nil
 	}
-
 	key := rc.chatType + ":" + rc.target
 
 	p.milestones.mu.Lock()
@@ -65,17 +121,6 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 	now := time.Now()
 	ts.updatedAt = now
 
-	send := func(text string) {
-		p.milestones.mu.Unlock()
-		// Send on a goroutine so the engine event loop is never blocked by
-		// lanxin HTTP latency; failures are only logged.
-		go func() {
-			if err := p.sendReplyText(rc, text); err != nil {
-				slog.Debug("lanxin: milestone send failed", "target", key, "error", err)
-			}
-		}()
-	}
-
 	if activity.Starting {
 		label := milestoneLabel(activity)
 		if label == "" {
@@ -83,7 +128,8 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 			return nil // tool is not worth broadcasting
 		}
 		// Stage-change rule: only announce when the coarse stage differs from
-		// the last announced one (or the previous announcement is stale).
+		// the last announced one (or the previous announcement is stale), so
+		// e.g. five consecutive Bash calls produce one line, not five.
 		sameStage := label == ts.lastLabel
 		stale := now.Sub(ts.lastAt) > milestoneStageIdleReset
 		if sameStage && !stale {
@@ -92,7 +138,30 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 		}
 		ts.lastLabel = label
 		ts.lastAt = now
-		send(label)
+
+		if p.milestonesStyle == "card" {
+			ts.cardRC = rc
+			kind := "update"
+			// Create only when no card exists yet; cardPending covers the window
+			// where the create op is still queued/running (msgId unknown), so a
+			// tool event racing the turn-start create cannot spawn a second card.
+			if ts.cardMsgID == "" && !ts.cardPending {
+				kind = "create"
+				ts.cardPending = true
+			}
+			ts.queue = append(ts.queue, cardOp{kind: kind, label: milestoneCardLabel(activity)})
+			p.startCardDrainLocked(key, ts)
+			p.milestones.mu.Unlock()
+			return nil
+		}
+
+		text := label
+		p.milestones.mu.Unlock()
+		go func() {
+			if err := p.sendReplyText(rc, text); err != nil {
+				slog.Debug("lanxin: milestone send failed", "target", key, "error", err)
+			}
+		}()
 		return nil
 	}
 
@@ -106,28 +175,152 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 		return nil
 	}
 	ts.failedAt = now
+
+	if p.milestonesStyle == "card" {
+		p.milestones.mu.Unlock()
+		return nil // the card keeps its working state; failures surface at turn end
+	}
+
 	label := milestoneLabel(core.ToolActivity{Starting: true, ToolName: activity.ToolName})
 	if label == "" {
 		label = "该步骤"
 	}
-	send("⚠️ " + label + " 未成功，正在继续尝试…")
+	p.milestones.mu.Unlock()
+	go func() {
+		if err := p.sendReplyText(rc, "⚠️ "+label+" 未成功，正在继续尝试…"); err != nil {
+			slog.Debug("lanxin: milestone send failed", "target", key, "error", err)
+		}
+	}()
 	return nil
 }
 
-// sweepMilestones drops tracker state idle for a while so the map does not
-// grow without bound across sessions.
-func (p *Platform) sweepMilestones() {
-	cutoff := time.Now().Add(-milestonePersistentTimeout)
+// OnTurnEnd implements core.TurnLifecycleListener: in card style the live
+// progress card is marked final (isLastUpdate) so it stops showing as
+// in-progress. The card is kept — withdrawing it would broadcast a recall
+// hint into the chat.
+func (p *Platform) OnTurnEnd(ctx context.Context, replyCtx any, ok bool) error {
+	rc, isRC := replyCtx.(replyContext)
+	if !isRC || rc.target == "" || !p.milestonesEnabled || p.milestonesStyle != "card" {
+		return nil
+	}
+	key := rc.chatType + ":" + rc.target
+
 	p.milestones.mu.Lock()
 	defer p.milestones.mu.Unlock()
-	for k, ts := range p.milestones.state {
-		if ts.updatedAt.Before(cutoff) {
-			delete(p.milestones.state, k)
+	ts := p.milestones.state[key]
+	if ts == nil || (ts.cardMsgID == "" && !ts.cardPending && len(ts.queue) == 0) {
+		return nil // no card was created for this turn
+	}
+	ts.cardRC = rc
+	ts.updatedAt = time.Now()
+	ts.queue = append(ts.queue, cardOp{kind: "finalize", ok: ok})
+	p.startCardDrainLocked(key, ts)
+	return nil
+}
+
+// startCardDrainLocked launches the per-target card worker when it is idle.
+// Callers must hold p.milestones.mu.
+func (p *Platform) startCardDrainLocked(key string, ts *milestoneState) {
+	if ts.draining {
+		return
+	}
+	ts.draining = true
+	go p.drainCardOps(key, ts)
+}
+
+// drainCardOps runs queued card operations strictly in order (create → update
+// → finalize), so HTTP latency never blocks the engine's event loop and a
+// finalize can never overtake the create it belongs to.
+func (p *Platform) drainCardOps(key string, ts *milestoneState) {
+	for {
+		p.milestones.mu.Lock()
+		if len(ts.queue) == 0 {
+			ts.draining = false
+			p.milestones.mu.Unlock()
+			return
+		}
+		op := ts.queue[0]
+		ts.queue = ts.queue[1:]
+		rc := ts.cardRC
+		cardID := ts.cardMsgID
+		p.milestones.mu.Unlock()
+
+		switch op.kind {
+		case "create":
+			id, err := p.sendProgressCard(rc, progressCardHeadTitle, progressCardBodyTitle, progressCardBody, op.label, cardColourWorking)
+			p.milestones.mu.Lock()
+			ts.cardPending = false
+			if err == nil {
+				ts.cardMsgID = id
+			}
+			p.milestones.mu.Unlock()
+			if err != nil {
+				slog.Debug("lanxin: progress card create failed", "target", key, "error", err)
+				continue
+			}
+		case "update":
+			if cardID == "" {
+				continue
+			}
+			if err := p.updateProgressCard(cardID, op.label, cardColourWorking, false); err != nil {
+				slog.Debug("lanxin: progress card update failed", "target", key, "error", err)
+			}
+		case "finalize":
+			if cardID == "" {
+				continue
+			}
+			text, colour := progressCardDoneText, cardColourDone
+			if !op.ok {
+				text, colour = progressCardFailText, cardColourFailed
+			}
+			if err := p.updateProgressCard(cardID, text, colour, true); err != nil {
+				slog.Debug("lanxin: progress card finalize failed", "target", key, "error", err)
+			}
+			// The card is intentionally NOT withdrawn: lanxin shows a visible
+			// "message recalled" hint to everyone in the chat, which reads as
+			// noise. It stays as a completed status card instead.
+			p.milestones.mu.Lock()
+			ts.cardPending = false
+			if ts.cardMsgID == cardID {
+				ts.cardMsgID = ""
+			}
+			p.milestones.mu.Unlock()
 		}
 	}
 }
 
-// watchMilestones periodically prunes milestone throttle state.
+// sweepMilestones drops tracker state idle for a while so the map does not
+// grow without bound, and finalises any progress card left behind by a turn
+// that never reported its end (crashed agent process, restart). The card is
+// finalised rather than withdrawn — a recall shows a visible hint in lanxin.
+func (p *Platform) sweepMilestones() {
+	cutoff := time.Now().Add(-milestonePersistentTimeout)
+	var stale []string
+
+	p.milestones.mu.Lock()
+	for k, ts := range p.milestones.state {
+		if !ts.updatedAt.Before(cutoff) {
+			continue
+		}
+		if ts.cardMsgID != "" {
+			stale = append(stale, ts.cardMsgID)
+			ts.cardMsgID = ""
+		}
+		ts.cardPending = false // a stuck create must not block the next turn
+		if len(ts.queue) == 0 {
+			delete(p.milestones.state, k)
+		}
+	}
+	p.milestones.mu.Unlock()
+
+	for _, id := range stale {
+		if err := p.updateProgressCard(id, progressCardFailText, cardColourFailed, true); err != nil {
+			slog.Debug("lanxin: stale progress card finalize failed", "error", err)
+		}
+	}
+}
+
+// watchMilestones periodically prunes milestone state and stale cards.
 func (p *Platform) watchMilestones() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -160,6 +353,27 @@ func milestoneLabel(a core.ToolActivity) string {
 		return "✍️ 正在整理分析结果…"
 	case a.ToolName == "Read" || a.ToolName == "Grep" || a.ToolName == "Glob":
 		return "🔎 正在检索资料…"
+	}
+	return ""
+}
+
+// milestoneCardLabel is the short card-header variant of milestoneLabel: the
+// appCard status description is limited to ~30 bytes, so no emoji and no long
+// phrasing.
+func milestoneCardLabel(a core.ToolActivity) string {
+	switch {
+	case strings.HasPrefix(a.ToolName, "mcp__jira-qax__"):
+		return "正在查询 Jira…"
+	case strings.HasPrefix(a.ToolName, "mcp__wiki-qax__"):
+		return "正在检索知识库…"
+	case a.ToolName == "Bash":
+		return "正在执行分析…"
+	case a.ToolName == "WebSearch":
+		return "正在联网检索…"
+	case a.ToolName == "Write" || a.ToolName == "Edit":
+		return "正在整理结果…"
+	case a.ToolName == "Read" || a.ToolName == "Grep" || a.ToolName == "Glob":
+		return "正在检索资料…"
 	}
 	return ""
 }
