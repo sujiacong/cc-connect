@@ -660,6 +660,25 @@ type StreamingCardPlatform interface {
 	CreateStreamingCard(ctx context.Context, replyCtx any) (StreamingCard, error)
 }
 
+// ToolActivity describes one tool lifecycle transition during an agent turn
+// (a tool starting, or finishing). It is broadcast to platforms that opt in
+// via ToolActivityListener BEFORE the display-mode gating, so even a
+// quiet/compact session can surface coarse progress ("正在查询 Jira…") without
+// exposing the raw thinking/tool text the display settings intentionally hide.
+type ToolActivity struct {
+	Starting bool   // true when the tool begins, false when it finished
+	ToolName string // e.g. "Bash", "Read", "mcp__jira-qax__jira_search"
+	Summary  string // short input preview at start; empty at finish
+	Status   string // finish only: "completed", "failed", or ""
+}
+
+// ToolActivityListener is an optional interface platforms implement to observe
+// per-tool start/finish events. Errors (e.g. ErrNotSupported) are ignored by
+// the engine.
+type ToolActivityListener interface {
+	OnToolActivity(ctx context.Context, replyCtx any, activity ToolActivity) error
+}
+
 // CardStatus represents the visual status of a card header.
 type CardStatus string
 

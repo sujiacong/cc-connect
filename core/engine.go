@@ -338,6 +338,11 @@ type DisplayCfg struct {
 	ToolMessages     bool
 	HistoryMaxLen    *int // max runes for /history entries; nil = default, 0 = no truncation
 	HideAgentFooter  bool // strip model/token footer lines emitted as agent text
+	// DropInterimText makes the delivered answer use only the agent's final
+	// result text, discarding the interim text segments accumulated during the
+	// turn (process narration the agent emitted between tool calls). Without
+	// it, quiet mode merges those segments into the final answer.
+	DropInterimText bool
 }
 
 // InstantReplyCfg controls the immediate confirmation reply sent when a message
@@ -4952,6 +4957,17 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
+				// Honour the agent's NO_REPLY marker on background turns too.
+				// The foreground path suppresses the marker, but without the
+				// same check here a bare "NO_REPLY" (the agent deciding it has
+				// nothing to say) would be delivered as a real message.
+				originalResponse := fullResponse
+				if isSilentReply(originalResponse) {
+					fullResponse = ""
+				} else if stripped, ok := stripTrailingSilent(originalResponse); ok {
+					fullResponse = stripped
+				}
+
 				if fullResponse != "" {
 					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
 						e.send(p, replyCtx, chunk)
@@ -4965,7 +4981,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// takes event-channel ownership) blocks until this goroutine
 				// exits — so a foreground AddHistory is always ordered after
 				// any unsolicited AddHistory.
-				session.AddHistory("assistant", fullResponse)
+				// Record the ORIGINAL response (marker included) so the agent
+				// keeps context of its own NO_REPLY decision.
+				session.AddHistory("assistant", originalResponse)
 				sessions.Save()
 
 				// Reset for potential subsequent unsolicited turn.
@@ -5404,6 +5422,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolUse:
 			toolCount++
+			// Broadcast the tool lifecycle to ToolActivityListener platforms
+			// (e.g. lanxin milestones) BEFORE the display-mode gating below, so
+			// quiet/compact sessions can still surface coarse progress without
+			// re-enabling the raw thinking/tool text the display settings hide.
+			if tpl, ok := p.(ToolActivityListener); ok {
+				tpl.OnToolActivity(e.ctx, replyCtx, ToolActivity{
+					Starting: true,
+					ToolName: event.ToolName,
+					Summary:  truncateIf(event.ToolInput, 200),
+				})
+			}
 			if hasRichCard {
 				// When tool messages are suppressed, skip card updates on tool events.
 				if !e.display.ToolMessages {
@@ -5533,6 +5562,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventToolResult:
+			if tpl, ok := p.(ToolActivityListener); ok {
+				tpl.OnToolActivity(e.ctx, replyCtx, ToolActivity{
+					Starting: false,
+					ToolName: event.ToolName,
+					Status:   event.ToolStatus,
+				})
+			}
 			if e.display.ToolMessages {
 				result := strings.TrimSpace(event.ToolResult)
 				if result == "" {
@@ -5857,7 +5893,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool progress is hidden, segmentStart stays 0 and textParts
 			// contains ALL text across tool boundaries. Prefer the full accumulated
 			// text over event.Content which only contains the last assistant segment.
-			if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
+			// DropInterimText overrides this: keep only the final result text so
+			// interim narration (agent text emitted between tool calls) is dropped
+			// instead of merged into the delivered answer. Falls back to the
+			// accumulated text when the result event carries no content.
+			if e.display.DropInterimText && strings.TrimSpace(fullResponse) != "" {
+				// keep fullResponse (event.Content) as-is
+			} else if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
 				fullResponse = strings.Join(textParts, "")
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")

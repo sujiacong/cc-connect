@@ -202,6 +202,7 @@ type DisplayConfig struct {
 	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
 	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 	HideAgentFooter      *bool   `toml:"hide_agent_footer"`      // strip agent-emitted model/token footer lines; default false
+	DropInterimText      *bool   `toml:"drop_interim_text"`      // final answer uses only the agent's final result text, dropping interim narration; default false
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -942,6 +943,20 @@ func EffectiveDisplay(cfg *Config, proj *ProjectConfig) (mode string, thinkingMe
 // EffectiveHistoryMaxLen returns the per-entry /history truncation length.
 // Resolution: project [display] > global [display] > default 1000. A value
 // of 0 disables truncation.
+// EffectiveDropInterimText reports whether the delivered answer should use only
+// the agent's final result text instead of the accumulated turn text. With it
+// enabled, interim narration the agent emitted between tool calls is dropped
+// rather than merged into the final answer (quiet mode's default behaviour).
+func EffectiveDropInterimText(cfg *Config, proj *ProjectConfig) bool {
+	if proj != nil && proj.Display != nil && proj.Display.DropInterimText != nil {
+		return *proj.Display.DropInterimText
+	}
+	if cfg.Display.DropInterimText != nil {
+		return *cfg.Display.DropInterimText
+	}
+	return false
+}
+
 func EffectiveHistoryMaxLen(cfg *Config, proj *ProjectConfig) int {
 	if proj != nil && proj.Display != nil && proj.Display.HistoryMaxLen != nil {
 		return *proj.Display.HistoryMaxLen
