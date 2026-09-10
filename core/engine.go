@@ -5157,6 +5157,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 		e.send(state.platform, state.replyCtx, replyContent)
 	}
+	// Let the platform show its own processing indicator immediately (same beat
+	// as the instant reply), rather than waiting for the first tool activity.
+	e.notifyTurnStart(state.platform, state.replyCtx)
 
 	// Idle timeout: resets on every received event (0 = disabled)
 	var idleTimer *time.Timer
@@ -6344,6 +6347,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 					e.send(queued.platform, queued.replyCtx, replyContent)
 				}
+				e.notifyTurnStart(queued.platform, queued.replyCtx)
 
 				session.AddHistory("user", queued.content)
 				// Persist queued user message immediately (mirror of the
@@ -6381,6 +6385,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					doneReaction = func() { doneTI.AddDoneReaction(replyCtx) }
 				}
 			}
+
+			// The answer has been delivered — let platforms finalise/dismiss any
+			// transient processing indicator for this turn.
+			e.notifyTurnEnd(p, replyCtx, true)
 
 			return
 
@@ -6422,6 +6430,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if state.agentSession == nil || !state.agentSession.Alive() {
 				e.notifyDroppedQueuedMessages(state, event.Error)
 			}
+			e.notifyTurnEnd(p, replyCtx, false)
 			return
 		}
 	}
@@ -6536,6 +6545,35 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 	steps[idx].Success = event.ToolSuccess
 	steps[idx].Done = true
 	return steps
+}
+
+// notifyTurnStart tells platforms implementing TurnStartListener that an agent
+// turn is beginning, so a transient processing indicator (e.g. lanxin's
+// dynamic appCard) can appear immediately instead of waiting for the first
+// tool activity. Platforms without the interface are skipped; errors are only
+// logged.
+func (e *Engine) notifyTurnStart(p Platform, replyCtx any) {
+	l, has := p.(TurnStartListener)
+	if !has {
+		return
+	}
+	if err := l.OnTurnStart(e.ctx, replyCtx); err != nil {
+		slog.Debug("engine: turn start listener failed", "platform", p.Name(), "error", err)
+	}
+}
+
+// notifyTurnEnd tells platforms implementing TurnLifecycleListener that the
+// agent turn finished (ok=false on error), so a transient processing
+// indicator (e.g. lanxin's dynamic appCard) can be finalised or dismissed.
+// Platforms without the interface are skipped; errors are only logged.
+func (e *Engine) notifyTurnEnd(p Platform, replyCtx any, ok bool) {
+	l, has := p.(TurnLifecycleListener)
+	if !has {
+		return
+	}
+	if err := l.OnTurnEnd(e.ctx, replyCtx, ok); err != nil {
+		slog.Debug("engine: turn lifecycle listener failed", "platform", p.Name(), "ok", ok, "error", err)
+	}
 }
 
 // notifyDroppedQueuedMessages drains pendingMessages from the state and

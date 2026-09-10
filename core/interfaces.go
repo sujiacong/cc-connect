@@ -679,6 +679,22 @@ type ToolActivityListener interface {
 	OnToolActivity(ctx context.Context, replyCtx any, activity ToolActivity) error
 }
 
+// TurnStartListener is an optional interface for platforms that want to react
+// the moment an agent turn begins — e.g. show a "processing" indicator right
+// away instead of waiting for the first tool activity. Called before the agent
+// produces any output, on the same beat as the built-in instant reply.
+type TurnStartListener interface {
+	OnTurnStart(ctx context.Context, replyCtx any) error
+}
+
+// TurnLifecycleListener is an optional interface for platforms that need to
+// bracket an agent turn — typically to finalise or dismiss a transient
+// "processing" indicator (e.g. lanxin's dynamic appCard) once the answer has
+// been delivered. ok is false when the turn ended with an error.
+type TurnLifecycleListener interface {
+	OnTurnEnd(ctx context.Context, replyCtx any, ok bool) error
+}
+
 // CardStatus represents the visual status of a card header.
 type CardStatus string
 
