@@ -1,6 +1,7 @@
 package lanxin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1961,5 +1962,131 @@ func TestHandleWSMessage_QuotedImageDownloadedOnDemand(t *testing.T) {
 	matches, _ := filepath.Glob(filepath.Join(p.downloadDir, quotedMediaDir, "img-ref*"))
 	if len(matches) != 1 {
 		t.Fatalf(".quoted files = %v, want exactly the downloaded img-ref", matches)
+	}
+}
+
+// --- milestone progress (core.ToolActivityListener) ---
+
+func TestMilestoneLabel_Map(t *testing.T) {
+	cases := []struct {
+		tool string
+		want string
+	}{
+		{"mcp__jira-qax__jira_search", "📋 正在查询 Jira…"},
+		{"mcp__jira-qax__jira_get_issue", "📋 正在查询 Jira…"},
+		{"mcp__wiki-qax__confluence_search", "📚 正在检索知识库文档…"},
+		{"Bash", "💻 正在执行分析命令…"},
+		{"Read", "🔎 正在检索资料…"},
+		{"Grep", "🔎 正在检索资料…"},
+		{"WebSearch", "🌐 正在联网检索…"},
+		{"Write", "✍️ 正在整理分析结果…"},
+		{"mcp__codebase-memory-mcp__query_graph", ""},
+		{"TaskList", ""},
+	}
+	for _, c := range cases {
+		got := milestoneLabel(core.ToolActivity{Starting: true, ToolName: c.tool})
+		if got != c.want {
+			t.Errorf("milestoneLabel(%q) = %q, want %q", c.tool, got, c.want)
+		}
+	}
+	// Finish events never map to a start label.
+	if got := milestoneLabel(core.ToolActivity{Starting: false, ToolName: "Bash"}); got != "" {
+		t.Errorf("finish event label = %q, want empty", got)
+	}
+}
+
+// waitForBotBodies polls until rec has at least n recorded bot (p2p) bodies.
+func waitForBotBodies(t *testing.T, rec *reqRecorder, n int, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if b := rec.botBodies(); len(b) >= n {
+			return b
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d bot bodies; have %d: %v", n, len(rec.botBodies()), rec.botBodies())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// enableMilestones turns on the milestone listener plumbing on a test platform.
+func enableMilestones(p *Platform) {
+	p.milestonesEnabled = true
+	p.milestones = &milestoneTracker{state: map[string]*milestoneState{}}
+}
+
+// TestOnToolActivity_ThrottledLines verifies tool start/finish events become
+// sparse milestone messages: the same stage inside the cooldown is dropped,
+// a different stage is sent, and a failed tool finish yields a warning line.
+func TestOnToolActivity_ThrottledLines(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	enableMilestones(p)
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	ctx := context.Background()
+
+	act := func(starting bool, tool, status string) {
+		t.Helper()
+		if err := p.OnToolActivity(ctx, rc, core.ToolActivity{Starting: starting, ToolName: tool, Status: status}); err != nil {
+			t.Fatalf("OnToolActivity: %v", err)
+		}
+	}
+
+	// Same jira stage twice inside the cooldown → only one line.
+	act(true, "mcp__jira-qax__jira_search", "")
+	act(true, "mcp__jira-qax__jira_get_issue", "")
+	// A different coarse stage → a second line.
+	act(true, "Bash", "")
+	// A failed finish of an unlabelled/uncooldowned tool → warning line.
+	act(false, "mcp__jira-qax__jira_search", "failed")
+
+	bodies := waitForBotBodies(t, rec, 3, 2*time.Second)
+	joined := strings.Join(bodies, "\n")
+	// The start line ends with the stage text; the warning line has an extra
+	// "… 未成功" suffix, so a quote-terminated match counts only start lines.
+	if strings.Count(joined, `正在查询 Jira…"`) != 1 {
+		t.Errorf("jira milestone start lines = %d, want 1 (dedup in cooldown)\n%v", strings.Count(joined, `正在查询 Jira…"`), joined)
+	}
+	if !strings.Contains(joined, "正在执行分析命令") {
+		t.Errorf("expected Bash milestone line, got %v", joined)
+	}
+	if !strings.Contains(joined, "未成功") {
+		t.Errorf("expected failed-tool warning line, got %v", joined)
+	}
+}
+
+// TestOnToolActivity_DisabledSkips verifies milestones are off by default and
+// nothing is sent when the platform option is not enabled.
+func TestOnToolActivity_DisabledSkips(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	if err := p.OnToolActivity(context.Background(), rc, core.ToolActivity{Starting: true, ToolName: "mcp__jira-qax__jira_search"}); err != nil {
+		t.Fatalf("OnToolActivity: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := rec.botBodies(); len(got) != 0 {
+		t.Errorf("milestones should be disabled by default, got %d bodies: %v", len(got), got)
+	}
+}
+
+// TestSendReplyText_TrimsBlankEdges verifies intermediate text is sent without
+// stray leading/trailing blank lines (a common agent-stream artifact).
+func TestSendReplyText_TrimsBlankEdges(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	if err := p.sendReplyText(rc, "\n结论\n\n\n   "); err != nil {
+		t.Fatalf("sendReplyText: %v", err)
+	}
+	bodies := rec.botBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("bot bodies = %d, want 1: %v", len(bodies), bodies)
+	}
+	m := decodeJSONBody(t, bodies[0])
+	ft, ok := m["msgData"].(map[string]any)["formatText"].(map[string]any)
+	if !ok {
+		t.Fatalf("message should be formatText, got %v", bodies[0])
+	}
+	if got, _ := ft["text"].(string); got != "结论" {
+		t.Errorf("text = %q, want 结论 (blank edges trimmed)", got)
 	}
 }

@@ -164,8 +164,14 @@ func (p *Platform) fileSendAllowed(fp string) bool {
 }
 
 // sendReplyText sends plain text to the reply target (@-mentioning the asking
-// user in group chats, same as the normal reply path).
+// user in group chats, same as the normal reply path). Leading/trailing blank
+// lines are trimmed so an intermediate segment ending in stray newlines (a
+// common agent-stream artifact) does not render as a tall empty bubble.
 func (p *Platform) sendReplyText(rc replyContext, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
 	if rc.chatType == "group" {
 		return p.sendGroupText(rc.target, content, rc.fromUserID)
 	}

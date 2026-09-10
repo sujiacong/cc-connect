@@ -66,6 +66,11 @@ type Platform struct {
 	// Checked by replyWithFiles before any upload so a prompt injection cannot
 	// exfiltrate arbitrary host files into the chat.
 	fileSendAllowDirs []string
+	// milestonesEnabled toggles coarse progress milestone messages while the
+	// agent works (core.ToolActivityListener); milestones holds per-chat
+	// throttle state keeping those lines sparse.
+	milestonesEnabled bool
+	milestones        *milestoneTracker
 }
 
 // replyContext holds the context needed to reply to a specific message or to
@@ -130,6 +135,8 @@ func New(opts map[string]any) (core.Platform, error) {
 
 	slog.Warn("lanxin: personal bot mode — private chat only receives creator messages")
 
+	milestones, _ := opts["milestones"].(bool)
+
 	return &Platform{
 		appID:                 appID,
 		appSecret:             appSecret,
@@ -140,6 +147,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		shareSessionInChannel: shareSession,
 		uploadMarkerTTL:       uploadMarkerTTL,
 		fileSendAllowDirs:     allowDirs,
+		milestonesEnabled:     milestones,
+		milestones:            &milestoneTracker{state: map[string]*milestoneState{}},
 	}, nil
 }
 
@@ -227,6 +236,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	go p.connectLoop()
 	if p.uploadMarkerTTL > 0 {
 		go p.watchUploadMarker()
+	}
+	if p.milestonesEnabled {
+		go p.watchMilestones()
 	}
 	return nil
 }
