@@ -76,6 +76,23 @@ type Platform struct {
 	// botSenderID is this bot's id inside a group, required by the message
 	// revoke API for group chats (bot_sender_id platform option).
 	botSenderID string
+	// acceptBotMessages opts in to processing messages sent by other bots
+	// (default false: such messages are ignored so two bots cannot ping-pong).
+	acceptBotMessages bool
+	// quoteReply makes outgoing replies quote the message being answered
+	// (refMsgId); enabled by default, disable with reply_quote = false.
+	quoteReply bool
+}
+
+// quoteID returns the message id a reply should quote, or "" when quoting is
+// disabled (reply_quote = false) or the reply context carries no message id.
+// Progress helpers deliberately pass "" instead so only real answers (and
+// receipts) carry the quoted original.
+func (p *Platform) quoteID(rc replyContext) string {
+	if !p.quoteReply {
+		return ""
+	}
+	return rc.msgID
 }
 
 // replyContext holds the context needed to reply to a specific message or to
@@ -146,6 +163,12 @@ func New(opts map[string]any) (core.Platform, error) {
 		milestonesStyle = "text"
 	}
 	botSenderID, _ := opts["bot_sender_id"].(string)
+	acceptBotMessages, _ := opts["accept_bot_messages"].(bool)
+	// reply_quote defaults to true (unset → enabled)
+	quoteReply := true
+	if v, ok := opts["reply_quote"].(bool); ok {
+		quoteReply = v
+	}
 
 	return &Platform{
 		appID:                 appID,
@@ -161,6 +184,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		milestonesStyle:       milestonesStyle,
 		milestones:            &milestoneTracker{state: map[string]*milestoneState{}},
 		botSenderID:           botSenderID,
+		acceptBotMessages:     acceptBotMessages,
+		quoteReply:            quoteReply,
 	}, nil
 }
 

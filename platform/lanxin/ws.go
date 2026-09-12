@@ -151,9 +151,47 @@ type lanxinEvent struct {
 	MsgID        string
 	IsAtMe       bool
 	SenderName   string
-	CallbackData string          // for approve_card_callback
-	MediaIDs     []string        // for file/image/video/voice messages
-	Quoted       *quotedMessage  // referenceMsg: the message this one quotes, if any
+	CallbackData string         // for approve_card_callback
+	MediaIDs     []string       // for file/image/video/voice messages
+	Quoted       *quotedMessage // referenceMsg: the message this one quotes, if any
+
+	// Group-callback extras. Lanxin's group push now carries the sender kind,
+	// the bot identity and the full mention lists; all of these are parsed
+	// tolerantly — older servers simply omit them and the zero values keep the
+	// previous behaviour intact.
+	SenderType string   // fromType: "user" or "bot"
+	BotID      string   // botId of the sending bot (when SenderType == "bot")
+	BotCreator string   // botCreator: creator of that bot
+	IsAtAll    bool     // reminder.isAtAll (@全体成员)
+	AtUserIDs  []string // reminder.staffs: mentioned users
+	AtBotIDs   []string // reminder.bots: mentioned bots
+}
+
+// extractIDs pulls string identifiers out of a lanxin mention list, whose
+// entries are either plain id strings or objects carrying the id under one of
+// a few known keys (staffId/openId/id/botId). Unknown shapes are skipped.
+func extractIDs(raw any) []string {
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, item := range list {
+		switch v := item.(type) {
+		case string:
+			if v != "" {
+				out = append(out, v)
+			}
+		case map[string]any:
+			for _, k := range []string{"staffId", "openId", "id", "botId"} {
+				if s, ok := v[k].(string); ok && s != "" {
+					out = append(out, s)
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 // parseWSMessage parses raw WS JSON, returning a list of events.
@@ -208,9 +246,13 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 			chatType = "group"
 		}
 
-		var isAtMe bool
+		var isAtMe, isAtAll bool
+		var atUserIDs, atBotIDs []string
 		if reminder, ok := data["reminder"].(map[string]any); ok {
 			isAtMe, _ = reminder["isAtMe"].(bool)
+			isAtAll, _ = reminder["isAtAll"].(bool)
+			atUserIDs = extractIDs(reminder["staffs"])
+			atBotIDs = extractIDs(reminder["bots"])
 		}
 
 		// extract text content msgData.text.content
@@ -260,6 +302,12 @@ func parseWSMessage(raw []byte) []lanxinEvent {
 			SenderName: getString(data, "senderName"),
 			MediaIDs:   mediaIDs,
 			Quoted:     parseQuotedMessage(data["referenceMsg"]),
+			SenderType: getString(data, "fromType"),
+			BotID:      getString(data, "botId"),
+			BotCreator: getString(data, "botCreator"),
+			IsAtAll:    isAtAll,
+			AtUserIDs:  atUserIDs,
+			AtBotIDs:   atBotIDs,
 		})
 	}
 	return result
@@ -288,12 +336,14 @@ func (p *Platform) handleWSMessage(raw []byte) {
 		if len(c) > 40 {
 			c = c[:40]
 		}
-		slog.Info("lanxin: ws event", "type", ev.EventType, "chatType", ev.ChatType, "groupId", ev.GroupID, "from", ev.From, "msgType", ev.MsgType, "content", c, "content_len", len(ev.Content))
+		slog.Info("lanxin: ws event", "type", ev.EventType, "chatType", ev.ChatType, "groupId", ev.GroupID, "from", ev.From, "msgType", ev.MsgType, "content", c, "content_len", len(ev.Content),
+			"senderType", ev.SenderType, "botId", ev.BotID, "isAtMe", ev.IsAtMe, "isAtAll", ev.IsAtAll,
+			"atUsers", len(ev.AtUserIDs), "atBots", len(ev.AtBotIDs))
 	}
 	for _, ev := range events {
 		switch ev.EventType {
 		case "approve_card_callback":
-			slog.Debug("lanxin: approve_card_callback received (ignored)", "from", ev.From)
+			p.handleApproveCardCallback(ev)
 			continue
 		case "bot_private_message", "bot_group_message":
 			// proceed
@@ -302,9 +352,20 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			continue
 		}
 
-		// group @bot filter (aligned with ws_client.py:174-176)
+		// Messages sent by another bot are ignored by default so two bots in
+		// the same group cannot ping-pong each other; set accept_bot_messages
+		// to opt in. Older servers omit fromType, in which case this is a no-op.
+		if ev.SenderType == "bot" && !p.acceptBotMessages {
+			slog.Debug("lanxin: message from a bot, skipping", "bot_id", ev.BotID, "bot_creator", ev.BotCreator)
+			continue
+		}
+
+		// group @bot filter (aligned with ws_client.py:174-176). isAtAll means
+		// the whole group was mentioned — the bot is included, so it still counts
+		// as being addressed (kept for backwards compatibility with servers that
+		// only send isAtMe).
 		if ev.ChatType == "group" && !ev.IsAtMe {
-			slog.Debug("lanxin: group message not @bot, skipping", "group", ev.GroupID)
+			slog.Debug("lanxin: group message not @bot, skipping", "group", ev.GroupID, "isAtAll", ev.IsAtAll)
 			continue
 		}
 
@@ -555,4 +616,26 @@ func stripMentionPrefix(s string) string {
 		return ""
 	}
 	return strings.TrimSpace(s[idx+1:])
+}
+
+// handleApproveCardCallback handles an approval-card button press. Lanxin
+// delivers the press as a dedicated event carrying the pressing staffId and
+// the button payload (eventData); until now the platform silently dropped it.
+//
+// The sending side is intentionally not wired yet: the approval-card message
+// type is still rolling out server-side and its field contract is unpublished,
+// so this handler parses and logs the callback, keeping a single hook point
+// where a press will later be routed back to the waiting agent interaction
+// (e.g. a permission question or an AskUserQuestion choice).
+func (p *Platform) handleApproveCardCallback(ev lanxinEvent) {
+	payload := strings.TrimSpace(ev.CallbackData)
+	if payload == "" {
+		slog.Info("lanxin: approve card callback (empty payload)", "from", ev.From)
+		return
+	}
+	slog.Info("lanxin: approve card callback", "from", ev.From, "payload_len", len(payload))
+	// Payload shape is not documented yet — keep a truncated preview so the
+	// real contract can be pinned down from traffic, then replace this with the
+	// routing call (approval → pending interaction).
+	slog.Debug("lanxin: approve card callback payload", "from", ev.From, "payload", truncateForLog([]byte(payload)))
 }

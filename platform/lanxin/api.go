@@ -26,7 +26,7 @@ import (
 // Markdown (aligned with the official lansenger channel plugin, whose every
 // AI reply goes through sendFormatText with the same {formatType:1,text}
 // body). Plain text with no Markdown characters renders unchanged.
-func (p *Platform) sendBotText(target string, content string) error {
+func (p *Platform) sendBotText(target string, content string, refMsgID string) error {
 	token, err := p.getAppToken()
 	if err != nil {
 		return fmt.Errorf("lanxin: sendBotText: get token: %w", err)
@@ -39,12 +39,17 @@ func (p *Platform) sendBotText(target string, content string) error {
 		},
 		"userIdList": []string{target},
 	}
+	// refMsgId quotes the message being answered (top-level field, same shape
+	// the official channel plugin uses).
+	if refMsgID != "" {
+		payload["refMsgId"] = refMsgID
+	}
 	return p.postAPI(botMsgPath, token, payload, "sendBotText")
 }
 
 // sendGroupText sends a rich-text (formatText, Markdown-rendered) message to a
 // group, @-mentioning mentionUserID when set.
-func (p *Platform) sendGroupText(target string, content string, mentionUserID string) error {
+func (p *Platform) sendGroupText(target string, content string, mentionUserID string, refMsgID string) error {
 	token, err := p.getAppToken()
 	if err != nil {
 		return fmt.Errorf("lanxin: sendGroupText: get token: %w", err)
@@ -62,6 +67,9 @@ func (p *Platform) sendGroupText(target string, content string, mentionUserID st
 		"msgData": map[string]any{
 			"formatText": text,
 		},
+	}
+	if refMsgID != "" {
+		payload["refMsgId"] = refMsgID
 	}
 	return p.postAPI(groupMsgPath, token, payload, "sendGroupText")
 }

@@ -72,6 +72,13 @@ type milestoneTracker struct {
 	state map[string]*milestoneState
 }
 
+// progressReplyContext strips the message id so progress lines are NOT sent as
+// quoted replies — only real answers (and receipts) quote the user's message.
+func progressReplyContext(rc replyContext) replyContext {
+	rc.msgID = ""
+	return rc
+}
+
 // OnTurnStart implements core.TurnStartListener: in card style the progress
 // card is created the moment the turn begins, so it shows up as fast as an
 // instant reply would — instead of waiting for the first tool call (which can
@@ -158,7 +165,7 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 		text := label
 		p.milestones.mu.Unlock()
 		go func() {
-			if err := p.sendReplyText(rc, text); err != nil {
+			if err := p.sendReplyText(progressReplyContext(rc), text); err != nil {
 				slog.Debug("lanxin: milestone send failed", "target", key, "error", err)
 			}
 		}()
@@ -187,7 +194,7 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 	}
 	p.milestones.mu.Unlock()
 	go func() {
-		if err := p.sendReplyText(rc, "⚠️ "+label+" 未成功，正在继续尝试…"); err != nil {
+		if err := p.sendReplyText(progressReplyContext(rc), "⚠️ "+label+" 未成功，正在继续尝试…"); err != nil {
 			slog.Debug("lanxin: milestone send failed", "target", key, "error", err)
 		}
 	}()

@@ -117,9 +117,9 @@ func (p *Platform) replyWithFiles(rc replyContext, content string) error {
 			continue
 		}
 		if rc.chatType == "group" {
-			err = p.sendGroupFile(rc.target, mediaID)
+			err = p.sendGroupFile(rc.target, mediaID, p.quoteID(rc))
 		} else {
-			err = p.sendBotFile(rc.target, mediaID)
+			err = p.sendBotFile(rc.target, mediaID, p.quoteID(rc))
 		}
 		if err != nil {
 			slog.Warn("lanxin: file message failed", "path", fp, "err", err)
@@ -173,9 +173,9 @@ func (p *Platform) sendReplyText(rc replyContext, content string) error {
 		return nil
 	}
 	if rc.chatType == "group" {
-		return p.sendGroupText(rc.target, content, rc.fromUserID)
+		return p.sendGroupText(rc.target, content, rc.fromUserID, p.quoteID(rc))
 	}
-	return p.sendBotText(rc.target, content)
+	return p.sendBotText(rc.target, content, p.quoteID(rc))
 }
 
 // uploadAppMedia uploads a local file via the self-built-app media API and
@@ -256,7 +256,7 @@ func (p *Platform) uploadAppMedia(filePath string) (string, error) {
 // sendBotFile sends a file message to a p2p chat. Lanxin files travel as
 // msgType "text" whose text payload carries mediaIds + mediaType (mirrors the
 // official SDK SendFile construction).
-func (p *Platform) sendBotFile(target, mediaID string) error {
+func (p *Platform) sendBotFile(target, mediaID string, refMsgID string) error {
 	token, err := p.getAppToken()
 	if err != nil {
 		return fmt.Errorf("lanxin: sendBotFile: get token: %w", err)
@@ -271,11 +271,14 @@ func (p *Platform) sendBotFile(target, mediaID string) error {
 		},
 		"userIdList": []string{target},
 	}
+	if refMsgID != "" {
+		payload["refMsgId"] = refMsgID
+	}
 	return p.postAPI(botMsgPath, token, payload, "sendBotFile")
 }
 
 // sendGroupFile sends a file message to a group chat.
-func (p *Platform) sendGroupFile(target, mediaID string) error {
+func (p *Platform) sendGroupFile(target, mediaID string, refMsgID string) error {
 	token, err := p.getAppToken()
 	if err != nil {
 		return fmt.Errorf("lanxin: sendGroupFile: get token: %w", err)
@@ -289,6 +292,9 @@ func (p *Platform) sendGroupFile(target, mediaID string) error {
 				"mediaType": msgMediaTypeFile,
 			},
 		},
+	}
+	if refMsgID != "" {
+		payload["refMsgId"] = refMsgID
 	}
 	return p.postAPI(groupMsgPath, token, payload, "sendGroupFile")
 }

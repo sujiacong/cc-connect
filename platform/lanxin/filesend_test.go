@@ -346,7 +346,7 @@ func TestParseAllowDirs(t *testing.T) {
 
 	// configured extras are resolved and appended
 	extra := t.TempDir()
-	dirs = parseAllowDirs("  " + extra + " , " + filepath.Join(extra, "workspace") + " ", downloadDir)
+	dirs = parseAllowDirs("  "+extra+" , "+filepath.Join(extra, "workspace")+" ", downloadDir)
 	if len(dirs) != 3 || dirs[1] != extra {
 		t.Errorf("parseAllowDirs(extra) = %v, want [%s %s <ws>]", dirs, downloadDir, extra)
 	}

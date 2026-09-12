@@ -173,7 +173,7 @@ func TestSendBotText_Success(t *testing.T) {
 		appToken:    "fake-token",
 		tokenExpiry: time.Now().Add(1 * time.Hour),
 	}
-	err := p.sendBotText("user-123", "hello")
+	err := p.sendBotText("user-123", "hello", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestSendBotText_APIError(t *testing.T) {
 		appToken:    "fake-token",
 		tokenExpiry: time.Now().Add(1 * time.Hour),
 	}
-	err := p.sendBotText("user-123", "hello")
+	err := p.sendBotText("user-123", "hello", "")
 	if err == nil {
 		t.Fatal("expected error for errCode != 0")
 	}
@@ -216,7 +216,7 @@ func TestSendGroupText_Success(t *testing.T) {
 		appToken:    "fake-token",
 		tokenExpiry: time.Now().Add(1 * time.Hour),
 	}
-	err := p.sendGroupText("group-456", "hello group", "")
+	err := p.sendGroupText("group-456", "hello group", "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -570,6 +570,7 @@ func newTestPlatformWithServerDelay(t *testing.T, allowFrom string, contentDispo
 		httpClient:        srv.Client(),
 		downloadDir:       downloadDir,
 		fileSendAllowDirs: []string{downloadDir},
+		quoteReply:        true, // mirrors the New() default (reply_quote unset → on)
 	}
 	return p, rec
 }
@@ -2269,4 +2270,112 @@ func TestProgressCard_TurnStartCreatesCardImmediately(t *testing.T) {
 	if got := rec.botBodies(); len(got) != 1 {
 		t.Errorf("exactly one card should be created, got %d", len(got))
 	}
+}
+
+// --- group callback extras (sender type / bot id / mention lists) ---
+
+func TestParseWSMessage_GroupExtras(t *testing.T) {
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"u1","fromType":"bot","botId":"bot-9","botCreator":"creator-1","groupId":"g1","msgType":"text","msgData":{"text":{"content":"@ICG hi"}},"msgId":"m1","reminder":{"isAtMe":true,"isAtAll":true,"staffs":[{"staffId":"u2"},{"openId":"u3"}],"bots":[{"botId":"bot-7"}]}}}]}`
+	evs := parseWSMessage([]byte(raw))
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	ev := evs[0]
+	if ev.SenderType != "bot" || ev.BotID != "bot-9" || ev.BotCreator != "creator-1" {
+		t.Errorf("sender extras = %q/%q/%q, want bot/bot-9/creator-1", ev.SenderType, ev.BotID, ev.BotCreator)
+	}
+	if !ev.IsAtMe || !ev.IsAtAll {
+		t.Errorf("isAtMe/isAtAll = %v/%v, want true/true", ev.IsAtMe, ev.IsAtAll)
+	}
+	if len(ev.AtUserIDs) != 2 || ev.AtUserIDs[0] != "u2" || ev.AtUserIDs[1] != "u3" {
+		t.Errorf("AtUserIDs = %v, want [u2 u3] (from staffId/openId shapes)", ev.AtUserIDs)
+	}
+	if len(ev.AtBotIDs) != 1 || ev.AtBotIDs[0] != "bot-7" {
+		t.Errorf("AtBotIDs = %v, want [bot-7]", ev.AtBotIDs)
+	}
+}
+
+// TestParseWSMessage_GroupExtrasAbsent verifies older servers that omit the new
+// fields keep the previous behaviour (zero values, no panic).
+func TestParseWSMessage_GroupExtrasAbsent(t *testing.T) {
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"u1","groupId":"g1","msgType":"text","msgData":{"text":{"content":"hi"}},"msgId":"m1","reminder":{"isAtMe":true}}}]}`
+	evs := parseWSMessage([]byte(raw))
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	ev := evs[0]
+	if ev.SenderType != "" || ev.BotID != "" || ev.IsAtAll || len(ev.AtUserIDs) != 0 || len(ev.AtBotIDs) != 0 {
+		t.Errorf("absent extras should stay zero-valued, got %+v", ev)
+	}
+	if !ev.IsAtMe {
+		t.Error("isAtMe should still parse without the new fields")
+	}
+}
+
+// TestHandleWSMessage_IgnoresBotSenderByDefault verifies messages sent by other
+// bots are dropped unless accept_bot_messages opts in.
+func TestHandleWSMessage_IgnoresBotSenderByDefault(t *testing.T) {
+	p, _, msgs := newTestPlatformWithCapture(t, "")
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"other-bot","fromType":"bot","botId":"bot-2","groupId":"g1","msgType":"text","msgData":{"text":{"content":"@ICG ping"}},"msgId":"m1","reminder":{"isAtMe":true}}}]}`
+	p.handleWSMessage([]byte(raw))
+	select {
+	case m := <-msgs:
+		t.Errorf("bot-sent message should be ignored by default, got %q", m.Content)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	p.acceptBotMessages = true
+	raw2 := strings.Replace(raw, `"msgId":"m1"`, `"msgId":"m2"`, 1)
+	p.handleWSMessage([]byte(raw2))
+	select {
+	case <-msgs:
+	case <-time.After(2 * time.Second):
+		t.Error("accept_bot_messages=true should let bot-sent messages through")
+	}
+}
+
+// --- reply quoting (refMsgId) ---
+
+func TestSendReplyText_QuotesOriginalMessage(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	if !p.quoteReply {
+		t.Fatal("quoteReply should default to true")
+	}
+	if err := p.sendReplyText(replyContext{chatType: "p2p", target: "u1", msgID: "orig-1"}, "结论"); err != nil {
+		t.Fatalf("sendReplyText: %v", err)
+	}
+	body := decodeJSONBody(t, rec.botBodies()[0])
+	if body["refMsgId"] != "orig-1" {
+		t.Errorf("refMsgId = %v, want orig-1", body["refMsgId"])
+	}
+}
+
+func TestSendReplyText_QuoteDisabledAndProgressStripped(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	rc := replyContext{chatType: "p2p", target: "u1", msgID: "orig-1"}
+
+	// Progress lines never quote, even with quoting enabled.
+	if err := p.sendReplyText(progressReplyContext(rc), "📋 正在查询 Jira…"); err != nil {
+		t.Fatalf("sendReplyText(progress): %v", err)
+	}
+	if body := decodeJSONBody(t, rec.botBodies()[0]); body["refMsgId"] != nil {
+		t.Errorf("progress line should not quote, got %v", body["refMsgId"])
+	}
+
+	// reply_quote=false turns quoting off globally.
+	p.quoteReply = false
+	if err := p.sendReplyText(rc, "结论"); err != nil {
+		t.Fatalf("sendReplyText: %v", err)
+	}
+	if body := decodeJSONBody(t, rec.botBodies()[1]); body["refMsgId"] != nil {
+		t.Errorf("reply_quote=false should drop refMsgId, got %v", body["refMsgId"])
+	}
+}
+
+// TestHandleApproveCardCallback_NoopWithoutPayload guards the approval-card
+// callback skeleton: it must accept events with and without a payload.
+func TestHandleApproveCardCallback_NoopWithoutPayload(t *testing.T) {
+	p, _ := newTestPlatformWithServer(t, "")
+	p.handleApproveCardCallback(lanxinEvent{EventType: "approve_card_callback", From: "u1"})
+	p.handleApproveCardCallback(lanxinEvent{EventType: "approve_card_callback", From: "u1", CallbackData: `{"action":"approve"}`})
 }
