@@ -167,6 +167,19 @@ type lanxinEvent struct {
 	AtBotIDs   []string // reminder.bots: mentioned bots
 }
 
+// formatIDList renders a mention list for logs — ids joined by commas, capped
+// so an @-all list cannot flood a log line (the count stays visible).
+func formatIDList(ids []string) string {
+	const maxShown = 5
+	if len(ids) == 0 {
+		return ""
+	}
+	if len(ids) > maxShown {
+		return strings.Join(ids[:maxShown], ",") + fmt.Sprintf("(+%d)", len(ids)-maxShown)
+	}
+	return strings.Join(ids, ",")
+}
+
 // extractIDs pulls string identifiers out of a lanxin mention list, whose
 // entries are either plain id strings or objects carrying the id under one of
 // a few known keys (staffId/openId/id/botId). Unknown shapes are skipped.
@@ -338,7 +351,7 @@ func (p *Platform) handleWSMessage(raw []byte) {
 		}
 		slog.Info("lanxin: ws event", "type", ev.EventType, "chatType", ev.ChatType, "groupId", ev.GroupID, "from", ev.From, "msgType", ev.MsgType, "content", c, "content_len", len(ev.Content),
 			"senderType", ev.SenderType, "botId", ev.BotID, "isAtMe", ev.IsAtMe, "isAtAll", ev.IsAtAll,
-			"atUsers", len(ev.AtUserIDs), "atBots", len(ev.AtBotIDs))
+			"atUsers", formatIDList(ev.AtUserIDs), "atBots", formatIDList(ev.AtBotIDs))
 	}
 	for _, ev := range events {
 		switch ev.EventType {

@@ -2379,3 +2379,16 @@ func TestHandleApproveCardCallback_NoopWithoutPayload(t *testing.T) {
 	p.handleApproveCardCallback(lanxinEvent{EventType: "approve_card_callback", From: "u1"})
 	p.handleApproveCardCallback(lanxinEvent{EventType: "approve_card_callback", From: "u1", CallbackData: `{"action":"approve"}`})
 }
+
+func TestFormatIDList(t *testing.T) {
+	if got := formatIDList(nil); got != "" {
+		t.Errorf("empty list = %q, want empty", got)
+	}
+	if got := formatIDList([]string{"u1", "u2"}); got != "u1,u2" {
+		t.Errorf("list = %q, want u1,u2", got)
+	}
+	got := formatIDList([]string{"a", "b", "c", "d", "e", "f", "g"})
+	if !strings.HasPrefix(got, "a,b,c,d,e") || !strings.Contains(got, "(+2)") {
+		t.Errorf("capped list = %q, want a,b,c,d,e(+2)", got)
+	}
+}
