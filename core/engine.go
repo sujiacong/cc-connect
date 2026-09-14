@@ -5896,16 +5896,30 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool progress is hidden, segmentStart stays 0 and textParts
 			// contains ALL text across tool boundaries. Prefer the full accumulated
 			// text over event.Content which only contains the last assistant segment.
-			// DropInterimText overrides this: keep only the final result text so
-			// interim narration (agent text emitted between tool calls) is dropped
-			// instead of merged into the delivered answer. Falls back to the
-			// accumulated text when the result event carries no content.
-			if e.display.DropInterimText && strings.TrimSpace(fullResponse) != "" {
+			// DropInterimText keeps only the final result text, so interim
+			// narration (agent text emitted between tool calls) is dropped
+			// instead of merged into the delivered answer.
+			//
+			// Safety valve: some agents deliver the answer across several text
+			// segments and the result event then carries only its tail (observed
+			// with the kimi CLI). Dropping the accumulated text in that case
+			// silently loses most of the answer, so only take the final segment
+			// when it accounts for the bulk of the turn's text; otherwise fall
+			// back to the accumulated text.
+			accumulated := ""
+			if len(textParts) > 0 {
+				accumulated = strings.Join(textParts, "")
+			}
+			dropInterim := e.display.DropInterimText &&
+				strings.TrimSpace(fullResponse) != "" &&
+				(accumulated == "" || len([]rune(fullResponse))*4 >= len([]rune(accumulated))*3)
+			switch {
+			case dropInterim:
 				// keep fullResponse (event.Content) as-is
-			} else if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
-				fullResponse = strings.Join(textParts, "")
-			} else if fullResponse == "" && len(textParts) > 0 {
-				fullResponse = strings.Join(textParts, "")
+			case len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages:
+				fullResponse = accumulated
+			case fullResponse == "" && len(textParts) > 0:
+				fullResponse = accumulated
 			}
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
