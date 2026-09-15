@@ -28,9 +28,14 @@ const (
 	// next tool start is treated as a fresh stage even if the label matches —
 	// otherwise the first milestone of a later turn (same stage as the previous
 	// turn) would be wrongly suppressed.
-	milestoneStageIdleReset    = 90 * time.Second
-	milestoneFailedCooldown    = 30 * time.Second
-	milestonePersistentTimeout = 5 * time.Minute // drop idle tracker state
+	milestoneStageIdleReset = 90 * time.Second
+	milestoneFailedCooldown = 30 * time.Second
+	// milestonePersistentTimeout must stay well ABOVE the longest plausible
+	// turn: agent turns routinely run 20-30 minutes, and a card that goes quiet
+	// that long (model thinking between tool calls) must NOT be mistaken for a
+	// crashed turn — that made a successful run show "已中断" while the answer
+	// was still being produced. This is only a backstop for a crashed process.
+	milestonePersistentTimeout = 45 * time.Minute
 
 	// progress card copy. bodyContent may contain simple HTML — <b> renders
 	// (verified), while the header status field does not support bold.
