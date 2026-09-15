@@ -45,6 +45,13 @@ const (
 	progressCardDoneText     = "已完成"
 	progressCardFailText     = "已中断"
 	progressCardStartingText = "正在处理…"
+
+	// progressCardHeartbeat keeps a live card moving while the agent is busy
+	// without emitting tool events (the model can think for many minutes
+	// between calls). Every interval with no stage update the header status is
+	// refreshed to progressCardHeartbeatText so the turn never looks stalled.
+	progressCardHeartbeat     = 3 * time.Minute
+	progressCardHeartbeatText = "仍在分析…"
 )
 
 // milestoneState tracks the current stage (and, in card style, the live card)
@@ -332,7 +339,30 @@ func (p *Platform) sweepMilestones() {
 	}
 }
 
-// watchMilestones periodically prunes milestone state and stale cards.
+// touchProgressCards refreshes any live progress card that has been silent for
+// progressCardHeartbeat, so a long turn (the model thinking between tool calls
+// can take many minutes) never looks stalled to the user. Refreshing also
+// updates updatedAt, which keeps an actively-running turn's card away from the
+// crash backstop in sweepMilestones.
+func (p *Platform) touchProgressCards() {
+	if !p.milestonesEnabled || p.milestonesStyle != "card" {
+		return
+	}
+	now := time.Now()
+
+	p.milestones.mu.Lock()
+	defer p.milestones.mu.Unlock()
+	for key, ts := range p.milestones.state {
+		if ts.cardMsgID == "" || now.Sub(ts.updatedAt) < progressCardHeartbeat {
+			continue
+		}
+		ts.updatedAt = now
+		ts.queue = append(ts.queue, cardOp{kind: "update", label: progressCardHeartbeatText})
+		p.startCardDrainLocked(key, ts)
+	}
+}
+
+// watchMilestones periodically heartbeats live cards and prunes stale state.
 func (p *Platform) watchMilestones() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -341,6 +371,7 @@ func (p *Platform) watchMilestones() {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
+			p.touchProgressCards()
 			p.sweepMilestones()
 		}
 	}
