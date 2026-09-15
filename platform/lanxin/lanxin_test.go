@@ -2237,11 +2237,10 @@ func TestOnTurnEnd_NoCardDoesNothing(t *testing.T) {
 	}
 }
 
-// TestProgressCard_TurnStartCreatesCardImmediately verifies the card is created
-// at turn start (as fast as the old instant reply) instead of waiting for the
-// first tool call, and that a following tool event updates that same card
-// rather than creating a second one.
-func TestProgressCard_TurnStartCreatesCardImmediately(t *testing.T) {
+// TestProgressCard_TurnStartDefersCard verifies the card is NOT created the
+// instant a turn starts (a greeting answered in seconds must not flash a card),
+// but appears once the start delay elapses while the turn is still running.
+func TestProgressCard_TurnStartDefersCard(t *testing.T) {
 	p, rec := newTestPlatformWithServer(t, "")
 	p.milestonesEnabled = true
 	p.milestonesStyle = "card"
@@ -2252,23 +2251,45 @@ func TestProgressCard_TurnStartCreatesCardImmediately(t *testing.T) {
 	if err := p.OnTurnStart(ctx, rc); err != nil {
 		t.Fatalf("OnTurnStart: %v", err)
 	}
-	waitForCond(t, 2*time.Second, "card create at turn start", func() bool { return len(rec.botBodies()) >= 1 })
+	time.Sleep(200 * time.Millisecond)
+	if got := rec.botBodies(); len(got) != 0 {
+		t.Fatalf("no card should be created immediately at turn start, got %d", len(got))
+	}
+
+	// Simulate the delay elapsing.
+	p.startCardAfterDelay(rc.chatType + ":" + rc.target)
+	waitForCond(t, 2*time.Second, "card create after delay", func() bool { return len(rec.botBodies()) >= 1 })
 	card := decodeJSONBody(t, rec.botBodies()[0])
 	cardData, _ := card["msgData"].(map[string]any)["appCard"].(map[string]any)
 	status, _ := cardData["headStatusInfo"].(map[string]any)
-	statusDesc, _ := status["description"].(string)
-	if !strings.Contains(statusDesc, progressCardStartingText) {
-		t.Errorf("initial status = %v, want it to contain %v", statusDesc, progressCardStartingText)
+	desc, _ := status["description"].(string)
+	if !strings.Contains(desc, progressCardStartingText) {
+		t.Errorf("initial status = %v, want it to contain %v", desc, progressCardStartingText)
 	}
+}
 
-	// A tool event right after must update that card, not create another.
-	if err := p.OnToolActivity(ctx, rc, core.ToolActivity{Starting: true, ToolName: "mcp__jira-qax__jira_search"}); err != nil {
-		t.Fatalf("OnToolActivity: %v", err)
+// TestProgressCard_ShortTurnCreatesNoCard verifies a turn that finishes before
+// the start delay produces no card at all.
+func TestProgressCard_ShortTurnCreatesNoCard(t *testing.T) {
+	p, rec := newTestPlatformWithServer(t, "")
+	p.milestonesEnabled = true
+	p.milestonesStyle = "card"
+	p.milestones = &milestoneTracker{state: map[string]*milestoneState{}}
+	rc := replyContext{chatType: "p2p", target: "staff-1"}
+	ctx := context.Background()
+
+	if err := p.OnTurnStart(ctx, rc); err != nil {
+		t.Fatalf("OnTurnStart: %v", err)
 	}
-	waitForCond(t, 2*time.Second, "card update", func() bool { return len(rec.cardUpdateBodies()) >= 1 })
-	time.Sleep(120 * time.Millisecond)
-	if got := rec.botBodies(); len(got) != 1 {
-		t.Errorf("exactly one card should be created, got %d", len(got))
+	if err := p.OnTurnEnd(ctx, rc, true); err != nil {
+		t.Fatalf("OnTurnEnd: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := rec.botBodies(); len(got) != 0 {
+		t.Errorf("a short turn must not create a card, got %d bodies: %v", len(got), got)
+	}
+	if len(rec.cardUpdateBodies()) != 0 {
+		t.Errorf("a short turn must not update any card, got %v", rec.cardUpdateBodies())
 	}
 }
 

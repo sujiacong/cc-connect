@@ -52,6 +52,12 @@ const (
 	// refreshed to progressCardHeartbeatText so the turn never looks stalled.
 	progressCardHeartbeat     = 3 * time.Minute
 	progressCardHeartbeatText = "仍在分析…"
+
+	// progressCardDelay holds the card back at turn start: a short turn (a
+	// greeting answered in a few seconds) should not flash a card at all. The
+	// card is created once this delay elapses with the turn still running, or
+	// immediately when the first tool activity appears (which means real work).
+	progressCardDelay = 6 * time.Second
 )
 
 // milestoneState tracks the current stage (and, in card style, the live card)
@@ -68,6 +74,7 @@ type milestoneState struct {
 	cardRC      replyContext // reply target used when the card was created
 	queue       []cardOp     // serialized card operations (protected by tracker mu)
 	draining    bool         // a worker is draining the queue
+	timer       *time.Timer  // delayed card creation (short turns never create one)
 }
 
 // cardOp is one queued progress-card operation; ops run strictly in order on a
@@ -113,11 +120,31 @@ func (p *Platform) OnTurnStart(ctx context.Context, replyCtx any) error {
 	if ts.cardMsgID != "" || ts.cardPending {
 		return nil // a card already exists (or is being created) for this turn
 	}
+	// Hold the card back briefly: a greeting answered in a few seconds should
+	// not flash a card. It appears when the delay elapses with the turn still
+	// running, or at once on the first tool activity.
 	ts.cardRC = rc
-	ts.cardPending = true
+	if ts.timer != nil {
+		ts.timer.Stop()
+	}
+	ts.timer = time.AfterFunc(progressCardDelay, func() { p.startCardAfterDelay(key) })
+	return nil
+}
+
+// startCardAfterDelay creates the progress card once progressCardDelay has
+// passed since the turn began, provided the turn is still running and no card
+// exists yet (tool activity may have created one earlier).
+func (p *Platform) startCardAfterDelay(key string) {
+	p.milestones.mu.Lock()
+	defer p.milestones.mu.Unlock()
+	ts := p.milestones.state[key]
+	if ts == nil || ts.cardMsgID != "" || ts.cardPending {
+		return
+	}
+	ts.timer = nil
+	ts.updatedAt = time.Now()
 	ts.queue = append(ts.queue, cardOp{kind: "create", label: progressCardStartingText})
 	p.startCardDrainLocked(key, ts)
-	return nil
 }
 
 // OnToolActivity implements core.ToolActivityListener: it turns coarse tool
@@ -160,6 +187,11 @@ func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity co
 
 		if p.milestonesStyle == "card" {
 			ts.cardRC = rc
+			// Real work started: cancel the start delay and show the card now.
+			if ts.timer != nil {
+				ts.timer.Stop()
+				ts.timer = nil
+			}
 			kind := "update"
 			// Create only when no card exists yet; cardPending covers the window
 			// where the create op is still queued/running (msgId unknown), so a
@@ -227,8 +259,17 @@ func (p *Platform) OnTurnEnd(ctx context.Context, replyCtx any, ok bool) error {
 	p.milestones.mu.Lock()
 	defer p.milestones.mu.Unlock()
 	ts := p.milestones.state[key]
-	if ts == nil || (ts.cardMsgID == "" && !ts.cardPending && len(ts.queue) == 0) {
-		return nil // no card was created for this turn
+	if ts == nil {
+		return nil
+	}
+	if ts.cardMsgID == "" && !ts.cardPending && len(ts.queue) == 0 {
+		// Short turn that finished before the card was ever created: cancel the
+		// pending delay so no card appears after the answer, and skip finalising.
+		if ts.timer != nil {
+			ts.timer.Stop()
+			ts.timer = nil
+		}
+		return nil
 	}
 	ts.cardRC = rc
 	ts.updatedAt = time.Now()
@@ -327,6 +368,10 @@ func (p *Platform) sweepMilestones() {
 		}
 		ts.cardPending = false // a stuck create must not block the next turn
 		if len(ts.queue) == 0 {
+			if ts.timer != nil {
+				ts.timer.Stop()
+				ts.timer = nil
+			}
 			delete(p.milestones.state, k)
 		}
 	}
