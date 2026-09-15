@@ -57,7 +57,7 @@ const (
 	// greeting answered in a few seconds) should not flash a card at all. The
 	// card is created once this delay elapses with the turn still running, or
 	// immediately when the first tool activity appears (which means real work).
-	progressCardDelay = 6 * time.Second
+	progressCardDelay = 20 * time.Second
 )
 
 // milestoneState tracks the current stage (and, in card style, the live card)
