@@ -2392,3 +2392,20 @@ func TestFormatIDList(t *testing.T) {
 		t.Errorf("capped list = %q, want a,b,c,d,e(+2)", got)
 	}
 }
+
+// TestMessageChunkLimit verifies the platform answers the engine's chunk-limit
+// query with a client-safe value (and honours the option override).
+func TestMessageChunkLimit(t *testing.T) {
+	p, _ := newTestPlatformWithServer(t, "")
+	if got := p.MessageChunkLimit(); got != defaultMessageChunkRunes {
+		t.Errorf("default chunk limit = %d, want %d", got, defaultMessageChunkRunes)
+	}
+	p.chunkRunes = 700
+	if got := p.MessageChunkLimit(); got != 700 {
+		t.Errorf("overridden chunk limit = %d, want 700", got)
+	}
+	p.chunkRunes = 0
+	if got := p.MessageChunkLimit(); got != defaultMessageChunkRunes {
+		t.Errorf("zero should fall back to default, got %d", got)
+	}
+}

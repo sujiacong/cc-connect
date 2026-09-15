@@ -4969,7 +4969,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				}
 
 				if fullResponse != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, chunkLimitFor(p)) {
 						e.send(p, replyCtx, chunk)
 					}
 				}
@@ -5381,7 +5381,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, chunkLimitFor(p)) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5404,7 +5404,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if !previewActive {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, chunkLimitFor(p)) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5479,7 +5479,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					} else {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, chunkLimitFor(p)) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5523,7 +5523,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if !previewActive {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
-							for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
+							for _, chunk := range SplitMessageCodeFenceAware(segment, chunkLimitFor(p)) {
 								sendWorkspace(p, replyCtx, chunk)
 							}
 						}
@@ -5558,7 +5558,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// the rich-card path. event.ToolInput itself is left untouched.
 				cardToolInput := truncateIf(toolInput, e.display.ToolMaxLen)
 				if !cp.AppendEvent(ProgressEntryToolUse, cardToolInput, event.ToolName, toolMsg) {
-					for _, chunk := range SplitMessageCodeFenceAware(toolMsg, maxPlatformMessageLen) {
+					for _, chunk := range SplitMessageCodeFenceAware(toolMsg, chunkLimitFor(p)) {
 						sendWorkspace(p, replyCtx, chunk)
 					}
 				}
@@ -5782,7 +5782,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !previewActive {
 					segment := strings.Join(textParts[segmentStart:], "")
 					if segment != "" {
-						for _, chunk := range SplitMessageCodeFenceAware(segment, maxPlatformMessageLen) {
+						for _, chunk := range SplitMessageCodeFenceAware(segment, chunkLimitFor(p)) {
 							sendWorkspace(p, replyCtx, chunk)
 						}
 					}
@@ -6067,7 +6067,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					// Fallback: send the response as a normal message — but never
 					// for a silent reply, which has no deliverable content.
 					if !isSilent {
-						for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+						for _, chunk := range SplitMessageCodeFenceAware(fullResponse, chunkLimitFor(p)) {
 							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 								return
 							}
@@ -6496,7 +6496,7 @@ channelClosed:
 			if segmentStart < len(textParts) {
 				unsent := strings.Join(textParts[segmentStart:], "")
 				if unsent != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(unsent, maxPlatformMessageLen) {
+					for _, chunk := range SplitMessageCodeFenceAware(unsent, chunkLimitFor(p)) {
 						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 							return
 						}
@@ -6506,7 +6506,7 @@ channelClosed:
 		} else if sp.finish(fullResponse, "") {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
-			for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+			for _, chunk := range SplitMessageCodeFenceAware(fullResponse, chunkLimitFor(p)) {
 				if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 					return
 				}
@@ -6559,6 +6559,22 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 	steps[idx].Success = event.ToolSuccess
 	steps[idx].Done = true
 	return steps
+}
+
+// chunkLimitFor returns the per-message rune limit used when splitting a long
+// answer for p: a platform may lower it via MessageChunkLimiter (e.g. lanxin,
+// whose clients truncate long text), otherwise the engine default applies.
+//
+// Splitting is purely a delivery concern and runs after the answer text has
+// been finalised (including any drop_interim_text decision); every chunk is
+// sent, so chunking itself never discards content.
+func chunkLimitFor(p Platform) int {
+	if l, ok := p.(MessageChunkLimiter); ok {
+		if n := l.MessageChunkLimit(); n > 0 {
+			return n
+		}
+	}
+	return maxPlatformMessageLen
 }
 
 // notifyTurnStart tells platforms implementing TurnStartListener that an agent

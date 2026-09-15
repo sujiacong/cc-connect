@@ -660,6 +660,19 @@ type StreamingCardPlatform interface {
 	CreateStreamingCard(ctx context.Context, replyCtx any) (StreamingCard, error)
 }
 
+// MessageChunkLimiter is an optional interface for platforms whose per-message
+// text limit is LOWER than the engine default (maxPlatformMessageLen runes).
+// The engine asks for the effective limit before splitting a long answer, so a
+// platform that truncates long messages client-side can request smaller
+// chunks. Returning <= 0 keeps the engine default.
+//
+// Note: chunking happens AFTER the answer text has been finalised (including
+// any display.drop_interim_text decision), and every resulting chunk is sent —
+// splitting never drops content.
+type MessageChunkLimiter interface {
+	MessageChunkLimit() int
+}
+
 // ToolActivity describes one tool lifecycle transition during an agent turn
 // (a tool starting, or finishing). It is broadcast to platforms that opt in
 // via ToolActivityListener BEFORE the display-mode gating, so even a

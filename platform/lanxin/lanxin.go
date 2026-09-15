@@ -30,6 +30,13 @@ const defaultAPIBase = "https://apigw.lx.qianxin.com"
 // (configurable via file_download_dir platform option).
 const defaultDownloadDir = "/root/icg-ai-bot/uploads"
 
+// defaultMessageChunkRunes caps a single outgoing text message. Lanxin clients
+// truncate very long messages, and the engine default (4000 RUNES) can be
+// ~12KB in UTF-8 for Chinese text — well past what the client shows. 1200
+// runes (~3.6KB) keeps a whole answer visible; override with the
+// message_chunk_runes platform option.
+const defaultMessageChunkRunes = 1200
+
 // Platform implements core.Platform for the Lanxin personal bot via WebSocket
 // long-connection (outbound, no public URL needed).
 type Platform struct {
@@ -82,6 +89,20 @@ type Platform struct {
 	// quoteReply makes outgoing replies quote the message being answered
 	// (refMsgId); enabled by default, disable with reply_quote = false.
 	quoteReply bool
+	// chunkRunes caps a single outgoing text message (see
+	// defaultMessageChunkRunes); message_chunk_runes overrides it.
+	chunkRunes int
+}
+
+// MessageChunkLimit implements core.MessageChunkLimiter: it tells the engine
+// how many runes fit in one lanxin text message, so a long answer is split
+// into several messages instead of being truncated by the client. Splitting
+// happens after the answer text is finalised, and every chunk is delivered.
+func (p *Platform) MessageChunkLimit() int {
+	if p.chunkRunes > 0 {
+		return p.chunkRunes
+	}
+	return defaultMessageChunkRunes
 }
 
 // quoteID returns the message id a reply should quote, or "" when quoting is
@@ -169,6 +190,11 @@ func New(opts map[string]any) (core.Platform, error) {
 	if v, ok := opts["reply_quote"].(bool); ok {
 		quoteReply = v
 	}
+	// message_chunk_runes: per-message rune cap (default 1200, see the const)
+	chunkRunes := defaultMessageChunkRunes
+	if v := optionInt(opts["message_chunk_runes"], defaultMessageChunkRunes); v > 0 {
+		chunkRunes = v
+	}
 
 	return &Platform{
 		appID:                 appID,
@@ -186,6 +212,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		botSenderID:           botSenderID,
 		acceptBotMessages:     acceptBotMessages,
 		quoteReply:            quoteReply,
+		chunkRunes:            chunkRunes,
 	}, nil
 }
 

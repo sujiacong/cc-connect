@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestMarkdownToSimpleHTML_Bold(t *testing.T) {
@@ -585,7 +586,7 @@ func TestMarkdownToSimpleHTML_Wikilink(t *testing.T) {
 	}{
 		{"simple wikilink", "see [[MyPage]]", "MyPage"},
 		{"wikilink with display text", "see [[MyPage|Display Text]]", "Display Text"},
-		{"wikilink escapes html", "see [[Page<script>]]", "Page&lt;script&gt;"},  // escapeHTML in step 3 handles this
+		{"wikilink escapes html", "see [[Page<script>]]", "Page&lt;script&gt;"}, // escapeHTML in step 3 handles this
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -658,6 +659,83 @@ func TestMarkdownToSimpleHTML_ManyInlineCodePlaceholders(t *testing.T) {
 		want := "<code>" + name + "</code>"
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %s, got %q", want, out)
+		}
+	}
+}
+
+// TestSplitMessageCodeFenceAware_NoContentLost is the guard for long answers:
+// whatever the limit, joining the chunks must reproduce the original text
+// (whitespace differences from line joins are normalised away). This is what
+// keeps a chunked answer from losing its tail — e.g. a long Chinese reply that
+// used to go out as one oversized message and got truncated by the client.
+func TestSplitMessageCodeFenceAware_NoContentLost(t *testing.T) {
+	// >1200 runes of Chinese plus a table and a code block, like a real answer.
+	nl := byte(10)
+	var b strings.Builder
+	for i := 0; i < 60; i++ {
+		b.WriteString(fmt.Sprintf("第 %d 段：内存配置与大页档位的说明文本，用于验证分块后内容完整。", i))
+		b.WriteByte(nl)
+	}
+	b.WriteString("| 页数 | 容量 | 余量 |")
+	b.WriteByte(nl)
+	b.WriteString("| 1700 | 3.32 GiB | 627 MiB |")
+	b.WriteByte(nl)
+	b.WriteString("| 1600 | 3.125 GiB | 417 MiB |")
+	b.WriteByte(nl)
+	b.WriteString("```")
+	b.WriteByte(nl)
+	b.WriteString("vi /usr/local/nswcf/icg_mgt/function/init_cpus_huage_page.sh")
+	b.WriteByte(nl)
+	b.WriteString("bash update_hugepage_conf.sh")
+	b.WriteByte(nl)
+	b.WriteString("```")
+	text := b.String()
+
+	// Each chunk re-opens the code fence it continues (by design, so every
+	// chunk renders standalone), so fence lines are ignored when comparing.
+	norm := func(v string) string {
+		var kept []string
+		for _, ln := range strings.Split(v, string(nl)) {
+			if strings.Contains(ln, "```") {
+				continue
+			}
+			kept = append(kept, ln)
+		}
+		// Join with no separator: chunk boundaries legitimately drop the
+		// newline that separated the split lines, and whitespace carries no
+		// content here — only non-whitespace characters must survive.
+		return strings.Join(strings.Fields(strings.Join(kept, " ")), "")
+	}
+	for _, limit := range []int{1200, 800, 300, 50} {
+		chunks := SplitMessageCodeFenceAware(text, limit)
+		if len(chunks) < 2 {
+			t.Fatalf("limit %d: expected splitting, got %d chunk(s)", limit, len(chunks))
+		}
+		for i, c := range chunks {
+			if n := utf8.RuneCountInString(c); n > limit {
+				t.Errorf("limit %d: chunk %d has %d runes (over limit)", limit, i, n)
+			}
+		}
+		if joined := strings.Join(chunks, ""); norm(joined) != norm(text) {
+			nj, nt := norm(joined), norm(text)
+			pos := 0
+			for pos < len(nj) && pos < len(nt) && nj[pos] == nt[pos] {
+				pos++
+			}
+			lo := pos - 60
+			if lo < 0 {
+				lo = 0
+			}
+			endJ, endT := pos+60, pos+60
+			if endJ > len(nj) {
+				endJ = len(nj)
+			}
+			if endT > len(nt) {
+				endT = len(nt)
+			}
+			t.Errorf("limit %d: content changed (%d -> %d bytes); first diff at %d", limit, len(text), len(joined), pos)
+			t.Errorf("  joined: %q", nj[lo:endJ])
+			t.Errorf("  text:   %q", nt[lo:endT])
 		}
 	}
 }
