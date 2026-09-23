@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -292,6 +293,25 @@ func (ks *kimiSession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.Re
 	}
 
 	if scanErr != nil {
+		// A cancelled context — the turn timeout (agent timeout_mins), /stop, or
+		// shutdown — closes stdout on purpose (see the goroutine above), and the
+		// scanner then reports "file already closed". That is not a read failure;
+		// passing it through verbatim is what showed users
+		// "错误: read stdout: read |0: file already closed" (2026-09-22). Report
+		// the real cause, and stay silent for an explicit stop/shutdown since the
+		// engine reports those paths itself.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			slog.Warn("kimiSession: stdout closed by context cancellation",
+				"reason", ctxErr, "timeout", ks.timeout)
+			if msg := turnAbortMessage(ctxErr, ks.timeout); msg != "" {
+				evt := core.Event{Type: core.EventError, Error: errors.New(msg)}
+				select {
+				case ks.events <- evt:
+				case <-ks.ctx.Done():
+				}
+			}
+			return
+		}
 		slog.Error("kimiSession: scanner error", "error", scanErr)
 		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", scanErr)}
 		select {
@@ -304,8 +324,14 @@ func (ks *kimiSession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.Re
 	if waitErr != nil {
 		stderrMsg := strings.TrimSpace(stderrBuf.String())
 		if stderrMsg != "" {
+			// The log keeps the whole stderr for diagnosis, but the event — which
+			// can reach the chat as the error reply — carries only its tail:
+			// kimi writes its entire tool context to stderr before dying, so the
+			// full text is tens of KB of internal detail (directory listings,
+			// generated scripts) ending with the one useful line
+			// ("error: failed to run prompt: ... 504 Gateway Time-out").
 			slog.Error("kimiSession: process failed", "error", waitErr, "stderr", stderrMsg)
-			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrTail(stderrMsg))}
 			select {
 			case ks.events <- evt:
 			case <-ks.ctx.Done():
@@ -568,4 +594,49 @@ func truncate(s string, maxRunes int) string {
 		return s
 	}
 	return string([]rune(s)[:maxRunes]) + "..."
+}
+
+// stderrTail returns the tail of a failing process's stderr for use as the
+// user-visible error: the last few lines, rune-capped, with a leading ellipsis
+// when truncated. The call site explains why the full text must not be
+// forwarded (kimi dumps its whole tool context to stderr before dying).
+func stderrTail(s string) string {
+	const maxLines, maxRunes = 3, 600
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	start := len(lines) - maxLines
+	if start < 0 {
+		start = 0
+	}
+	// Anchor on the last line that reads like an error: that line is the cause,
+	// and everything before it (generated scripts, directory dumps) is noise.
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(strings.ToLower(lines[i]), "error") {
+			start = i
+			break
+		}
+	}
+	lines = lines[start:]
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	out := strings.TrimSpace(strings.Join(lines, "\n"))
+	if r := []rune(out); len(r) > maxRunes {
+		out = "…" + string(r[len(r)-maxRunes:])
+	}
+	return out
+}
+
+// turnAbortMessage returns the user-facing text for a turn aborted through the
+// context, or "" when the abort should stay silent. A deadline means the turn
+// hit agent timeout_mins and the user needs to know why it stopped; an explicit
+// cancel (/stop, shutdown) is already reported by the engine, and the raw
+// ctx.Err() ("context canceled") tells a chat user nothing.
+func turnAbortMessage(ctxErr error, timeout time.Duration) string {
+	if ctxErr == nil || !errors.Is(ctxErr, context.DeadlineExceeded) {
+		return ""
+	}
+	if timeout > 0 {
+		return fmt.Sprintf("本轮处理超过 %s 未完成，已中止；可以把问题拆小后重试，或让我基于已查到的结论继续。", timeout)
+	}
+	return "本轮处理已超时中止；可以把问题拆小后重试，或让我基于已查到的结论继续。"
 }

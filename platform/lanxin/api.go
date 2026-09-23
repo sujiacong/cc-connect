@@ -139,14 +139,18 @@ func (p *Platform) downloadMedia(mediaID string) ([]byte, string, error) {
 	}
 
 	u := p.apiBase + "/v1/medias/" + mediaID + "/fetch?app_token=" + token
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// The bound comes from transferTimeout, and the request MUST go out on
+	// transferClient: httpClient's 30s Timeout covers the body read too, which is
+	// what killed a large download mid-transfer (2026-09-23, log bundle).
+	ctx, cancel := context.WithTimeout(context.Background(), p.transferTimeoutForRequest())
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("lanxin: downloadMedia: create request: %w", err)
 	}
 
-	resp, err := p.httpClient.Do(req)
+	started := time.Now()
+	resp, err := p.transferDo(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("lanxin: downloadMedia: do request: %w", err)
 	}
@@ -160,9 +164,33 @@ func (p *Platform) downloadMedia(mediaID string) ([]byte, string, error) {
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", fmt.Errorf("lanxin: downloadMedia: read body: %w", err)
+		// How far it got is the diagnostic that matters for a truncated transfer.
+		return nil, "", fmt.Errorf("lanxin: downloadMedia: read body after %s (%.1f MB received): %w",
+			time.Since(started).Round(time.Second), float64(len(data))/1024/1024, err)
 	}
+	slog.Debug("lanxin: media downloaded", "media_id", mediaID,
+		"bytes", len(data), "elapsed", time.Since(started).Round(time.Millisecond))
 	return data, resp.Header.Get("Content-Disposition"), nil
+}
+
+// transferTimeoutForRequest returns the media-transfer bound, falling back to
+// the default for hand-built Platforms (tests) that never ran New().
+func (p *Platform) transferTimeoutForRequest() time.Duration {
+	if p.transferTimeout > 0 {
+		return p.transferTimeout
+	}
+	return defaultTransferTimeoutMins * time.Minute
+}
+
+// transferDo sends a media request on transferClient — a client with no global
+// Timeout, so the per-request context is the only bound. Falls back to
+// httpClient when transferClient is unset (hand-built Platforms in tests).
+func (p *Platform) transferDo(req *http.Request) (*http.Response, error) {
+	client := p.transferClient
+	if client == nil {
+		client = p.httpClient
+	}
+	return client.Do(req)
 }
 
 // mediaExtFromDisposition extracts a file extension (e.g. ".pdf") from a
@@ -318,14 +346,31 @@ const defaultUploadMarkerTTL = 60 * time.Minute
 // uploads beyond this count are dropped so a marker cannot grow without bound.
 const maxSessionUploadFiles = 50
 
-// uploadWaitTimeout is how long a text command waits for a same-session media
-// download that is still in flight before proceeding. A large file (e.g. a 92MB
-// log package) can take several seconds to download — the download itself has a
-// 60s timeout — so 30s is a generous bound for it to finish. On timeout the
-// text command proceeds with whatever the session marker already contains: the
-// download keeps running and its eventual marker write stays visible to later
-// turns, so nothing is lost beyond that turn's injection.
-const uploadWaitTimeout = 30 * time.Second
+// uploadWaitGrace is added to the transfer budget to form a text command's
+// wait: the download must finish (transferTimeout) and then write its session
+// marker before the waiter reads it.
+const uploadWaitGrace = 15 * time.Second
+
+// uploadAckDelay is how long a text command waits before telling the user the
+// file is still arriving. Without it, a download measured in minutes looks
+// exactly like a hung bot.
+const uploadAckDelay = 10 * time.Second
+
+// uploadAckText is the heads-up sent when a download outlasts uploadAckDelay.
+const uploadAckText = "⏳ 文件还在接收中，下载完成后自动开始分析，请稍候…"
+
+// uploadPendingText is sent when a command is parked awaiting a download. It
+// must say "no need to resend" — not losing the command is the whole point.
+const uploadPendingText = "⏳ 文件还在接收中，下载完成后我会自动开始分析，无需重新发送指令。"
+
+// uploadWaitTimeout returns how long a text command waits for a same-session
+// media download that is still in flight. It TRACKS the transfer budget instead
+// of being a fixed number: on 2026-09-23 a 143MB package took 114s while the
+// old fixed 30s gave up mid-download, and the command was handed to the agent
+// as if no file had ever been sent (see Message.UploadPending).
+func (p *Platform) uploadWaitTimeout() time.Duration {
+	return p.transferTimeoutForRequest() + uploadWaitGrace
+}
 
 // uploadInflight tracks one in-flight media download for a chat session. It is
 // shared by all concurrent file messages of the same session (reference
@@ -380,6 +425,9 @@ func (p *Platform) finishSessionUpload(sessionKey string, uf *uploadInflight) {
 	p.uploadMu.Unlock()
 	if closeDone {
 		uf.once.Do(func() { close(uf.done) })
+		// The marker is written, so any command parked on this download can now
+		// run with its file list attached.
+		p.drainPendingTurns(sessionKey)
 	}
 }
 
@@ -404,6 +452,34 @@ func (p *Platform) waitSessionUploads(sessionKey string, timeout time.Duration) 
 	case <-timer.C:
 		return false
 	}
+}
+
+// ackSlowUploadWait sends a heads-up when a same-session download is still
+// running after uploadAckDelay, so a long transfer does not look like a hung
+// bot. The returned stop func cancels the pending heads-up and must be called
+// once the wait is over.
+func (p *Platform) ackSlowUploadWait(sessionKey string, rc replyContext) func() {
+	p.uploadMu.Lock()
+	uf := p.inflightUploads[sessionKey]
+	p.uploadMu.Unlock()
+	if uf == nil {
+		return func() {} // nothing in flight → nothing worth announcing
+	}
+	stop := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(uploadAckDelay)
+		defer timer.Stop()
+		select {
+		case <-uf.done: // finished before the delay — the waiter takes over
+		case <-timer.C:
+			if err := p.sendReplyText(progressReplyContext(rc), uploadAckText); err != nil {
+				slog.Debug("lanxin: upload ack failed", "error", err)
+			}
+		case <-stop:
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(stop) }) }
 }
 
 // sessionUploadFile is one file recorded in a session upload marker.
@@ -730,4 +806,63 @@ func (p *Platform) postAPIRaw(path string, token string, payload map[string]any,
 	}
 
 	return result.Data.MsgID, nil
+}
+
+// pendingTurn is a text command parked while its session's media download
+// finishes. finishSessionUpload → drainPendingTurns wakes it, so the command
+// reaches the agent WITH its file list instead of being run blind or dropped.
+type pendingTurn struct {
+	msg *core.Message
+	rc  replyContext
+}
+
+// parkPendingTurn defers a command until the session's download lands and tells
+// the user it is waiting. Only the latest command per session is kept: a newer
+// message supersedes the older intent, and by then the files are usually in
+// place anyway.
+func (p *Platform) parkPendingTurn(sessionKey string, msg *core.Message, rc replyContext) {
+	p.uploadMu.Lock()
+	if p.inflightUploads[sessionKey] == nil {
+		// The download finished between the wait timing out and this call, so no
+		// future finishSessionUpload will ever wake a parked turn — run it now
+		// instead of parking it forever.
+		p.uploadMu.Unlock()
+		msg.UploadedFiles = p.sessionUploadedFiles(sessionKey)
+		if len(msg.UploadedFiles) == 0 {
+			msg.UploadPending = true
+		}
+		go p.handler(p, msg)
+		return
+	}
+	if p.pendingTurns == nil {
+		p.pendingTurns = map[string][]*pendingTurn{}
+	}
+	p.pendingTurns[sessionKey] = []*pendingTurn{{msg: msg, rc: rc}}
+	p.uploadMu.Unlock()
+
+	// Explain the silence and — crucially — that no resend is needed.
+	if err := p.sendReplyText(progressReplyContext(rc), uploadPendingText); err != nil {
+		slog.Debug("lanxin: pending-turn notice failed", "error", err)
+	}
+}
+
+// drainPendingTurns hands parked commands to the agent now that the session's
+// downloads have finished. finishSessionUpload calls it right after the marker
+// write, so the file list is complete. When the download failed, the command
+// still goes through with UploadPending set, and the agent answers per
+// AGENTS.md §6.6 instead of pretending the session had no file.
+func (p *Platform) drainPendingTurns(sessionKey string) {
+	p.uploadMu.Lock()
+	pending := p.pendingTurns[sessionKey]
+	delete(p.pendingTurns, sessionKey)
+	p.uploadMu.Unlock()
+
+	for _, pt := range pending {
+		msg := pt.msg
+		msg.UploadedFiles = p.sessionUploadedFiles(sessionKey)
+		if len(msg.UploadedFiles) == 0 {
+			msg.UploadPending = true // download failed — let the agent say so
+		}
+		go p.handler(p, msg) // never block the goroutine that just finished a download
+	}
 }

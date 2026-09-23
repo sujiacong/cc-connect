@@ -546,6 +546,7 @@ type queuedMessage struct {
 	images            []ImageAttachment
 	files             []FileAttachment
 	uploadedFiles     []UploadedFile // session upload timeline; nil = platform does not track uploads
+	uploadPending     bool           // download still in flight when the command was queued
 	fromVoice         bool
 	userID            string
 	userName          string // sender's display name for sender injection
@@ -560,11 +561,11 @@ type queuedMessage struct {
 // every prompt-build site (direct turn + both queued-message drains) so the
 // injection covers all routing paths. nil → no injection; empty list → the
 // explicit "no upload this time" note.
-func (e *Engine) withUploadBlock(prompt string, files []UploadedFile) string {
+func (e *Engine) withUploadBlock(prompt string, files []UploadedFile, pending bool) string {
 	if files == nil {
 		return prompt
 	}
-	return UploadedFilesBlock(files) + "\n\n" + prompt
+	return UploadedFilesBlock(files, pending) + "\n\n" + prompt
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -3314,6 +3315,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		images:            msg.Images,
 		files:             msg.Files,
 		uploadedFiles:     msg.UploadedFiles,
+		uploadPending:     msg.UploadPending,
 		fromVoice:         msg.FromVoice,
 		userID:            msg.UserID,
 		userName:          msg.UserName,
@@ -3934,7 +3936,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// upload to this message (Message.UploadedFiles != nil), prepend the file
 	// list so the agent analyzes exactly this session's files. nil (other
 	// platforms) → no injection; empty list → explicit "no upload this time".
-	promptContent = e.withUploadBlock(promptContent, msg.UploadedFiles)
+	promptContent = e.withUploadBlock(promptContent, msg.UploadedFiles, msg.UploadPending)
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -6288,7 +6290,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
-				queuedPrompt := e.withUploadBlock(e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey), queued.uploadedFiles)
+				queuedPrompt := e.withUploadBlock(e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey), queued.uploadedFiles, queued.uploadPending)
 
 				state.mu.Lock()
 				as := state.agentSession // capture under lock to avoid race with cleanup
@@ -6429,14 +6431,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					Platform:   p.Name(),
 					Error:      event.Error.Error(),
 				})
-				userMsg := fmt.Sprintf(e.i18n.T(MsgError), errMsg)
+				// errMsgForUser: an agent's error text can be tens of KB of
+				// internal context (kimi dumps its whole tool output to stderr
+				// before dying) whose only useful part is the error line — it
+				// must never be pasted into the chat verbatim. Matching against
+				// agentErrorHandlers still uses the raw errMsg.
+				userMsg := fmt.Sprintf(e.i18n.T(MsgError), errMsgForUser(errMsg))
 				for _, h := range agentErrorHandlers {
 					if strings.Contains(errMsg, h.contains) {
 						userMsg = e.i18n.T(h.msgKey)
 						break
 					}
 				}
-				e.send(p, replyCtx, userMsg)
+				// Chunked: the error path used to call e.send directly and thus
+				// bypassed the platform chunk limit entirely (2026-09-18: a
+				// 52,495-byte stderr blob went out as ONE group message).
+				e.sendChunked(p, replyCtx, userMsg)
 			}
 			// Only drop queued messages if the agent session is dead.
 			// Some agents (e.g. Codex) emit EventError for per-turn failures
@@ -6658,7 +6668,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
-		prompt := e.withUploadBlock(e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey), queued.uploadedFiles)
+		prompt := e.withUploadBlock(e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey), queued.uploadedFiles, queued.uploadPending)
 
 		state.mu.Lock()
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)
@@ -12297,6 +12307,53 @@ func (e *Engine) sendAlreadyRenderedWithError(p Platform, replyCtx any, content 
 // send wraps p.Send with error logging, slow-operation warnings, and outgoing rate limiting.
 func (e *Engine) send(p Platform, replyCtx any, content string) {
 	_ = e.sendWithError(p, replyCtx, content)
+}
+
+// sendChunked sends content as several platform-sized messages, honouring the
+// platform's MessageChunkLimiter. Normal answers already split inline at their
+// call sites; this helper exists for paths that must not bypass the limit —
+// notably the agent-error reply, which was previously sent as a single message
+// and pushed a 52KB stderr blob into a lanxin group (2026-09-18).
+func (e *Engine) sendChunked(p Platform, replyCtx any, content string) {
+	for _, chunk := range SplitMessageCodeFenceAware(content, chunkLimitFor(p)) {
+		e.send(p, replyCtx, chunk)
+	}
+}
+
+// maxUserErrMsgRunes caps how much of an agent error is shown to a chat user.
+// The cause is nearly always a single line ("...504 Gateway Time-out"); the
+// rest is internal context the user cannot act on.
+const maxUserErrMsgRunes = 400
+
+// errMsgForUser condenses an agent error string into something worth showing in
+// chat. Short errors pass through untouched; long ones are reduced to the last
+// line that reads like an error (falling back to the last non-empty line), so
+// a multi-KB stderr dump becomes one actionable sentence.
+func errMsgForUser(s string) string {
+	s = strings.TrimSpace(s)
+	if len([]rune(s)) <= maxUserErrMsgRunes {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	pick := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		if l == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(l), "error") {
+			pick = l
+			break
+		}
+		if pick == "" {
+			pick = l // remember the last non-empty line as a fallback
+		}
+	}
+	if pick == "" {
+		pick = s
+	}
+	return truncateStr(pick, maxUserErrMsgRunes) +
+		fmt.Sprintf("\n（错误详情共 %d 字符，完整内容见服务端日志）", len([]rune(s)))
 }
 
 // sendRaw sends content without local-reference rendering. This is used for raw

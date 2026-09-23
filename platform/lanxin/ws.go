@@ -373,12 +373,18 @@ func (p *Platform) handleWSMessage(raw []byte) {
 			continue
 		}
 
-		// group @bot filter (aligned with ws_client.py:174-176). isAtAll means
-		// the whole group was mentioned — the bot is included, so it still counts
-		// as being addressed (kept for backwards compatibility with servers that
-		// only send isAtMe).
-		if ev.ChatType == "group" && !ev.IsAtMe {
-			slog.Debug("lanxin: group message not @bot, skipping", "group", ev.GroupID, "isAtAll", ev.IsAtAll)
+		// group @bot filter. reminder.isAtMe is authoritative WHEN PRESENT, but
+		// bot_group_message frequently arrives with no reminder at all — the
+		// mention exists only as the textual "@botname …" prefix (实测 2026-09-18:
+		// isAtMe=false / atUsers="" / atBots="" while content was
+		// "@ICG智能助手 在吗"). Trusting isAtMe alone silently dropped EVERY
+		// group message, so the text prefix — the same shape stripMentionPrefix()
+		// removes — is the fallback. isAtAll also counts: the whole group was
+		// mentioned, which includes the bot (the previous comment claimed this
+		// but the code did not honour it).
+		if ev.ChatType == "group" && !ev.IsAtMe && !ev.IsAtAll && !p.mentionedInGroup(ev.Content) {
+			slog.Debug("lanxin: group message not @bot, skipping",
+				"group", ev.GroupID, "isAtAll", ev.IsAtAll, "content_head", truncRunes(ev.Content, 40))
 			continue
 		}
 
@@ -472,17 +478,37 @@ func (p *Platform) handleWSMessage(raw []byte) {
 
 		slog.Debug("lanxin: text received", "user", ev.From, "chatType", ev.ChatType, "len", len(ev.Content))
 		go func() {
-			// A file message sent moments ago may still be downloading (large
-			// files take seconds; the download itself has a 60s timeout). Wait
-			// for it before reading the session marker. Runs in this worker
-			// goroutine so the WS read loop is never blocked. On timeout the
-			// message proceeds with the current marker state — the download
-			// keeps running and its marker write stays visible to later turns.
-			p.waitSessionUploads(sessionKey, uploadWaitTimeout)
+			// A file message sent moments ago may still be downloading. Wait for
+			// it before reading the session marker. Runs in this worker goroutine
+			// so the WS read loop is never blocked.
+			//
+			// The wait tracks the transfer budget (uploadWaitTimeout), because a
+			// fixed bound proved too short: 2026-09-23 a 143MB package needed 114s
+			// while the wait allowed 30s, so the command went to the agent with an
+			// empty file list and was told "本会话未从蓝信上传过文件" — a claim
+			// that was simply false.
+			rc := replyContext{
+				chatType:   ev.ChatType,
+				target:     target,
+				senderName: ev.SenderName,
+				fromUserID: ev.From,
+			}
+			stopAck := p.ackSlowUploadWait(sessionKey, rc)
+			arrived := p.waitSessionUploads(sessionKey, p.uploadWaitTimeout())
+			stopAck()
 			// Inject this session's full upload timeline (if any) so the agent
 			// analyzes exactly the files the current session uploaded, without
 			// scanning uploads/ history or another session's files.
 			msg.UploadedFiles = p.sessionUploadedFiles(sessionKey)
+			if !arrived && len(msg.UploadedFiles) == 0 {
+				// The download outlasted the wait. Rather than run the turn
+				// without its files (the agent would be told "no upload" while a
+				// package is still arriving), park the command: finishSessionUpload
+				// wakes it once the download lands, so the user never has to
+				// resend. The command is not lost — it is deferred.
+				p.parkPendingTurn(sessionKey, msg, rc)
+				return
+			}
 			p.handler(p, msg)
 		}()
 	}
@@ -629,6 +655,34 @@ func stripMentionPrefix(s string) string {
 		return ""
 	}
 	return strings.TrimSpace(s[idx+1:])
+}
+
+// mentionedInGroup reports whether a group message textually addresses this
+// bot. Lanxin does not always deliver reminder.isAtMe (see the group filter in
+// handleWSMessage), so the "@botname …" prefix — the very shape
+// stripMentionPrefix() strips — is used as the fallback signal.
+//
+// bot_name (platform option) pins the match to this bot's own display name.
+// Without it any leading "@" counts: group replies keep working, but a message
+// mentioning someone else can also trigger the bot — set bot_name to avoid it.
+func (p *Platform) mentionedInGroup(content string) bool {
+	s := strings.TrimSpace(content)
+	if !strings.HasPrefix(s, "@") {
+		return false
+	}
+	if p.botName == "" {
+		return true
+	}
+	return strings.HasPrefix(s, "@"+p.botName)
+}
+
+// truncRunes shortens s to at most n runes for logging (never splits a rune).
+func truncRunes(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n]) + "…"
 }
 
 // handleApproveCardCallback handles an approval-card button press. Lanxin

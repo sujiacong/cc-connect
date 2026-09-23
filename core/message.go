@@ -438,6 +438,13 @@ type Message struct {
 	// files. nil means the platform does not participate in upload tracking (no
 	// injection); a non-nil empty slice means "session, but no upload this time".
 	UploadedFiles []UploadedFile
+	// UploadPending marks that a media download for this session was still in
+	// flight when the command was routed (the platform's wait timed out). With
+	// an empty UploadedFiles it means "a file is arriving but has not landed
+	// yet" — without it the agent would be told the session never uploaded
+	// anything, which is both wrong and actively misleading (2026-09-23: a
+	// 143MB package needed 114s while the wait allowed only 30s).
+	UploadPending bool
 	Audio         *AudioAttachment    // voice message (if any)
 	Location      *LocationAttachment // geographical location (if any)
 	ExtraContent  string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent

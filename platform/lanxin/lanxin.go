@@ -37,17 +37,31 @@ const defaultDownloadDir = "/root/icg-ai-bot/uploads"
 // message_chunk_runes platform option.
 const defaultMessageChunkRunes = 1200
 
+// defaultTransferTimeoutMins bounds one media download/upload (overridable via
+// the transfer_timeout_mins platform option). Sized for a log bundle over the
+// lanxin gateway, not for an API call.
+const defaultTransferTimeoutMins = 5
+
 // Platform implements core.Platform for the Lanxin personal bot via WebSocket
 // long-connection (outbound, no public URL needed).
 type Platform struct {
-	appID                 string
-	appSecret             string
-	apiBase               string
-	allowFrom             string
-	downloadDir           string
-	handler               core.MessageHandler
-	dedup                 core.MessageDedup
-	httpClient            *http.Client
+	appID       string
+	appSecret   string
+	apiBase     string
+	allowFrom   string
+	downloadDir string
+	handler     core.MessageHandler
+	dedup       core.MessageDedup
+	httpClient  *http.Client
+	// transferClient serves media download/upload. httpClient is deliberately
+	// short (30s) because a slow API call means trouble — but http.Client.Timeout
+	// bounds the WHOLE request including the body read, so reusing it for media
+	// silently capped transfers at 30s and made the download's own 60s context
+	// deadline unreachable (2026-09-23, a log bundle: "read body: context
+	// deadline exceeded (Client.Timeout ...)" after exactly 30s). transferTimeout
+	// is the single bound for one transfer.
+	transferClient        *http.Client
+	transferTimeout       time.Duration
 	tokenMu               sync.Mutex
 	appToken              string
 	tokenExpiry           time.Time
@@ -68,6 +82,11 @@ type Platform struct {
 	// marker (markerMu).
 	uploadMu        sync.Mutex
 	inflightUploads map[string]*uploadInflight
+	// pendingTurns parks text commands whose session had a download in flight
+	// past the wait. finishSessionUpload hands them to the agent once the download
+	// lands (or fails), so a slow transfer costs waiting time, not the command.
+	// Guarded by uploadMu.
+	pendingTurns map[string][]*pendingTurn
 	// fileSendAllowDirs is the symlink-resolved allow-list of directories
 	// outgoing {{file:...}} files may come from (downloadDir always included).
 	// Checked by replyWithFiles before any upload so a prompt injection cannot
@@ -83,6 +102,10 @@ type Platform struct {
 	// botSenderID is this bot's id inside a group, required by the message
 	// revoke API for group chats (bot_sender_id platform option).
 	botSenderID string
+	// botName is this bot's display name, used to detect a group mention
+	// textually when the server omits reminder.isAtMe (bot_name platform
+	// option). Empty means any leading "@" counts as addressing the bot.
+	botName string
 	// acceptBotMessages opts in to processing messages sent by other bots
 	// (default false: such messages are ignored so two bots cannot ping-pong).
 	acceptBotMessages bool
@@ -184,6 +207,13 @@ func New(opts map[string]any) (core.Platform, error) {
 		milestonesStyle = "text"
 	}
 	botSenderID, _ := opts["bot_sender_id"].(string)
+	// bot_name: display name of this bot, used for the group @-fallback (see
+	// mentionedInGroup). Without it a group message starting with any "@" is
+	// treated as addressing the bot.
+	botName, _ := opts["bot_name"].(string)
+	if botName == "" {
+		slog.Warn("lanxin: bot_name not set — any leading '@' in a group message counts as a mention of this bot")
+	}
 	acceptBotMessages, _ := opts["accept_bot_messages"].(bool)
 	// reply_quote defaults to true (unset → enabled)
 	quoteReply := true
@@ -195,14 +225,25 @@ func New(opts map[string]any) (core.Platform, error) {
 	if v := optionInt(opts["message_chunk_runes"], defaultMessageChunkRunes); v > 0 {
 		chunkRunes = v
 	}
+	// transfer_timeout_mins: bound for one media download/upload (default 5).
+	// Log bundles are tens of MB; a 30s cap (the old httpClient.Timeout) killed
+	// them mid-download. API calls keep their own short timeout.
+	transferTimeout := defaultTransferTimeoutMins * time.Minute
+	if v := optionInt(opts["transfer_timeout_mins"], defaultTransferTimeoutMins); v > 0 {
+		transferTimeout = time.Duration(v) * time.Minute
+	}
 
 	return &Platform{
-		appID:                 appID,
-		appSecret:             appSecret,
-		apiBase:               apiBase,
-		allowFrom:             allowFrom,
-		downloadDir:           downloadDir,
-		httpClient:            &http.Client{Timeout: 30 * time.Second},
+		appID:       appID,
+		appSecret:   appSecret,
+		apiBase:     apiBase,
+		allowFrom:   allowFrom,
+		downloadDir: downloadDir,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		// No global Timeout: one media transfer is legitimately long, and the
+		// per-request context (transferTimeout) is the bound that should apply.
+		transferClient:        &http.Client{},
+		transferTimeout:       transferTimeout,
 		shareSessionInChannel: shareSession,
 		uploadMarkerTTL:       uploadMarkerTTL,
 		fileSendAllowDirs:     allowDirs,
@@ -210,6 +251,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		milestonesStyle:       milestonesStyle,
 		milestones:            &milestoneTracker{state: map[string]*milestoneState{}},
 		botSenderID:           botSenderID,
+		botName:               botName,
 		acceptBotMessages:     acceptBotMessages,
 		quoteReply:            quoteReply,
 		chunkRunes:            chunkRunes,

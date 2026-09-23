@@ -20,11 +20,19 @@ import (
 //     conversation (AskUserQuestion when ambiguous).
 //   - files empty (non-nil) → the session exists but has no upload; forbid
 //     using any uploads/ file and tell the user to upload first.
+//   - pending=true with files empty → the download is STILL RUNNING. The agent
+//     must stop early and ask the user to retry, never act as if no file was
+//     ever sent (the two are different statements, see Message.UploadPending).
 //
 // Callers only invoke this when Message.UploadedFiles != nil (nil means the
 // platform does not track uploads, e.g. other IM platforms).
-func UploadedFilesBlock(files []UploadedFile) string {
+func UploadedFilesBlock(files []UploadedFile, pending bool) string {
 	if len(files) == 0 {
+		if pending {
+			return "【本次上传文件】用户刚发送的文件尚未就绪（下载未完成或已失败），因此本轮没有任何可用文件。" +
+				"请立即结束本轮：不要检索知识库、不要猜测文件内容、不得使用 uploads/ 目录中任何文件，" +
+				"只回复一句话——文件尚未接收完成，请稍后回复「分析」，或重新上传后再试。"
+		}
 		return "【本次上传文件】本会话未从蓝信上传过文件，不得使用 uploads/ 目录中任何文件。"
 	}
 

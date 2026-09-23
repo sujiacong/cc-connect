@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -211,7 +210,10 @@ func (p *Platform) uploadAppMedia(filePath string) (string, error) {
 	// "type" (url_helpers.go WithMediaTypeString), NOT "mediaType" — the
 	// server rejects the latter with errCode 50052 缺少上传media类型.
 	u := p.apiBase + appMediaUploadPath + "?app_token=" + token + "&type=file&width=0&height=0&duration=0"
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Uploads ride the same transfer bound/client as downloads: a multi-MB file
+	// through the gateway needs far more than the httpClient 30s cap, which also
+	// covers the body and would abort the write mid-flight.
+	ctx, cancel := context.WithTimeout(context.Background(), p.transferTimeoutForRequest())
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, &buf)
 	if err != nil {
@@ -219,7 +221,7 @@ func (p *Platform) uploadAppMedia(filePath string) (string, error) {
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
-	resp, err := p.httpClient.Do(req)
+	resp, err := p.transferDo(req)
 	if err != nil {
 		return "", fmt.Errorf("lanxin: uploadAppMedia: do request: %w", err)
 	}

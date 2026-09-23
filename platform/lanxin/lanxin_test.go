@@ -2430,3 +2430,261 @@ func TestMessageChunkLimit(t *testing.T) {
 		t.Errorf("zero should fall back to default, got %d", got)
 	}
 }
+
+// TestMentionedInGroup pins the group @-fallback used when the server omits
+// reminder.isAtMe (实测 2026-09-18: bot_group_message carried no reminder at
+// all, so isAtMe was false while content was "@ICG智能助手 在吗").
+func TestMentionedInGroup(t *testing.T) {
+	cases := []struct {
+		name    string
+		botName string
+		content string
+		want    bool
+	}{
+		{"pinned name matches", "ICG智能助手", "@ICG智能助手 在吗", true},
+		{"pinned name, no space after mention", "ICG智能助手", "@ICG智能助手在吗", true},
+		{"pinned name, leading spaces", "ICG智能助手", "  @ICG智能助手 在吗", true},
+		{"pinned name, someone else mentioned", "ICG智能助手", "@张三 看下这个", false},
+		{"pinned name, no mention", "ICG智能助手", "大家好", false},
+		{"pinned name, mention mid-text", "ICG智能助手", "麻烦 @ICG智能助手 看下", false},
+		{"unpinned, any mention", "", "@任何人 你好", true},
+		{"unpinned, no mention", "", "大家好", false},
+		{"unpinned, bare at", "", "@", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Platform{botName: tc.botName}
+			if got := p.mentionedInGroup(tc.content); got != tc.want {
+				t.Fatalf("mentionedInGroup(%q) with bot_name=%q = %v, want %v",
+					tc.content, tc.botName, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleWSMessage_GroupMentionWithoutReminder is the regression test for
+// the 2026-09-18 outage: 蓝信 delivered bot_group_message WITHOUT a reminder
+// object, so isAtMe was false and every group message was dropped with
+// "not @bot, skipping" — including ones that plainly said "@ICG智能助手 在吗".
+// A textual mention must still route the message to the handler.
+func TestHandleWSMessage_GroupMentionWithoutReminder(t *testing.T) {
+	p, _ := newTestPlatformWithServer(t, "*")
+	p.botName = "ICG智能助手"
+
+	var mu sync.Mutex
+	got := 0
+	p.handler = func(core.Platform, *core.Message) { mu.Lock(); got++; mu.Unlock() }
+
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"bob","groupId":"g1","msgType":"text","msgData":{"text":{"content":"@ICG智能助手 在吗"}},"msgId":"gm-noreminder-1"}}]}`
+	p.handleWSMessage([]byte(raw))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := got
+		mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			if n != 1 {
+				t.Fatalf("textual @mention with no reminder was not routed to the handler (got %d, want 1)", n)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestHandleWSMessage_GroupNoMentionWithoutReminder is the negative control:
+// a group message with no mention at all must stay skipped (the fallback must
+// not turn the bot into a listener for every group message).
+func TestHandleWSMessage_GroupNoMentionWithoutReminder(t *testing.T) {
+	p, _ := newTestPlatformWithServer(t, "*")
+	p.botName = "ICG智能助手"
+
+	var mu sync.Mutex
+	got := 0
+	p.handler = func(core.Platform, *core.Message) { mu.Lock(); got++; mu.Unlock() }
+
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"bob","groupId":"g1","msgType":"text","msgData":{"text":{"content":"大家好"}},"msgId":"gm-noreminder-2"}}]}`
+	p.handleWSMessage([]byte(raw))
+
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 0 {
+		t.Fatalf("group message without a mention was routed to the handler (got %d, want 0)", got)
+	}
+}
+
+// TestHandleWSMessage_GroupAtAllIsAccepted covers the other half of the same
+// bug: the filter comment claimed isAtAll (mentioning the whole group, which
+// includes the bot) counts, but the code only checked isAtMe — so "@全体成员"
+// was dropped too.
+func TestHandleWSMessage_GroupAtAllIsAccepted(t *testing.T) {
+	p, _ := newTestPlatformWithServer(t, "*")
+	p.botName = "ICG智能助手"
+
+	var mu sync.Mutex
+	got := 0
+	p.handler = func(core.Platform, *core.Message) { mu.Lock(); got++; mu.Unlock() }
+
+	raw := `{"events":[{"type":"bot_group_message","data":{"from":"bob","groupId":"g1","msgType":"text","msgData":{"text":{"content":"@全体成员 看下这个"}},"msgId":"gm-atall-1","reminder":{"isAtAll":true}}}]}`
+	p.handleWSMessage([]byte(raw))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := got
+		mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			if n != 1 {
+				t.Fatalf("@全体成员 message was not routed to the handler (got %d, want 1)", n)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestDownloadMediaNotCappedByHTTPClientTimeout is the regression for the
+// 2026-09-23 failure: downloadMedia ran on the shared httpClient, whose 30s
+// Timeout bounds the whole request INCLUDING the body read, so a log bundle
+// died at exactly 30s with "read body: context deadline exceeded
+// (Client.Timeout ...)" — the download's own 60s context never got a chance.
+// Media transfers must ride transferClient, whose bound is transferTimeout.
+func TestDownloadMediaNotCappedByHTTPClientTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == tokenPath:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errCode":0,"errMsg":"ok","data":{"appToken":"tok","expiresIn":7200}}`))
+		case strings.HasSuffix(r.URL.Path, "/fetch"):
+			time.Sleep(300 * time.Millisecond) // far longer than httpClient's timeout
+			_, _ = w.Write([]byte("file-content"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		appID:     "a",
+		appSecret: "s",
+		apiBase:   srv.URL,
+		// Deliberately tiny: the old code path aborted the body read here.
+		httpClient:      &http.Client{Timeout: 20 * time.Millisecond},
+		transferClient:  &http.Client{}, // no global timeout
+		transferTimeout: 3 * time.Second,
+	}
+
+	data, _, err := p.downloadMedia("m-slow")
+	if err != nil {
+		t.Fatalf("download must not be capped by httpClient.Timeout: %v", err)
+	}
+	if string(data) != "file-content" {
+		t.Fatalf("unexpected body: %q", data)
+	}
+
+	// The transfer bound must still apply — a wider timeout is not no timeout.
+	p.transferTimeout = 20 * time.Millisecond
+	if _, _, err := p.downloadMedia("m-slow"); err == nil {
+		t.Fatal("transferTimeout must still bound a stalled download")
+	}
+}
+
+// TestParkedTurnResumesAfterDownloadLands pins the park/drain mechanism: a
+// command that outlasts the upload wait is neither run blind nor dropped — it
+// is held until the download finishes, then delivered WITH its file list, so
+// the user never has to resend the instruction.
+func TestParkedTurnResumesAfterDownloadLands(t *testing.T) {
+	const sk = "lanxin:p2p:user-1"
+	p, _, msgs := newTestPlatformWithCaptureDelay(t, "*", 0)
+
+	uf := p.beginSessionUpload(sk)
+	p.parkPendingTurn(sk, &core.Message{SessionKey: sk, Content: "分析"}, replyContext{chatType: "p2p", target: "user-1"})
+
+	// Parked: nothing may reach the agent while the download is still running.
+	select {
+	case m := <-msgs:
+		t.Fatalf("parked command must not reach the agent yet, got %+v", m)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// The download lands (marker written) and finishes -> the command resumes.
+	if err := p.appendSessionUploads(sk, sessionUploadFile{
+		Path: filepath.Join(p.downloadDir, "pkg.zip"), MediaID: "m1",
+		OriginalName: "pkg.zip", UploadedAt: "2026-09-23T13:33:41+08:00",
+	}); err != nil {
+		t.Fatalf("appendSessionUploads: %v", err)
+	}
+	p.finishSessionUpload(sk, uf)
+
+	select {
+	case m := <-msgs:
+		if m.Content != "分析" {
+			t.Fatalf("resumed command content = %q, want 分析", m.Content)
+		}
+		if m.UploadPending {
+			t.Fatal("resumed command must not be flagged pending once the file landed")
+		}
+		if len(m.UploadedFiles) != 1 || m.UploadedFiles[0].OriginalName != "pkg.zip" {
+			t.Fatalf("resumed command must carry the file list, got %+v", m.UploadedFiles)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked command was never resumed after the download finished")
+	}
+}
+
+// TestParkedTurnSurvivesFailedDownload: when the download dies, the parked
+// command still reaches the agent — flagged UploadPending so it answers per
+// AGENTS.md §6.6 rather than silently vanishing.
+func TestParkedTurnSurvivesFailedDownload(t *testing.T) {
+	const sk = "lanxin:p2p:user-2"
+	p, _, msgs := newTestPlatformWithCaptureDelay(t, "*", 0)
+
+	uf := p.beginSessionUpload(sk)
+	p.parkPendingTurn(sk, &core.Message{SessionKey: sk, Content: "分析"}, replyContext{chatType: "p2p", target: "user-2"})
+	p.finishSessionUpload(sk, uf) // nothing was saved -> the download failed
+
+	select {
+	case m := <-msgs:
+		if !m.UploadPending {
+			t.Fatal("a command whose download failed must be flagged UploadPending")
+		}
+		if len(m.UploadedFiles) != 0 {
+			t.Fatalf("expected no files, got %+v", m.UploadedFiles)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked command was lost when the download failed")
+	}
+}
+
+// TestParkPendingTurnAfterDownloadFinished covers the race where the download
+// lands between the wait timing out and parkPendingTurn: nothing would ever
+// wake a parked turn then, so park must detect the finished download and run
+// the command immediately instead of holding it forever.
+func TestParkPendingTurnAfterDownloadFinished(t *testing.T) {
+	const sk = "lanxin:p2p:user-3"
+	p, _, msgs := newTestPlatformWithCaptureDelay(t, "*", 0)
+
+	if err := p.appendSessionUploads(sk, sessionUploadFile{
+		Path: filepath.Join(p.downloadDir, "pkg.zip"), MediaID: "m1",
+		OriginalName: "pkg.zip", UploadedAt: "2026-09-23T13:33:41+08:00",
+	}); err != nil {
+		t.Fatalf("appendSessionUploads: %v", err)
+	}
+	// No beginSessionUpload: the download is already done, so there is no
+	// in-flight tracker to wake a parked turn later.
+	p.parkPendingTurn(sk, &core.Message{SessionKey: sk, Content: "分析"}, replyContext{chatType: "p2p", target: "user-3"})
+
+	select {
+	case m := <-msgs:
+		if len(m.UploadedFiles) != 1 {
+			t.Fatalf("command must carry the already-downloaded file, got %+v", m.UploadedFiles)
+		}
+		if m.UploadPending {
+			t.Fatal("a finished download must not mark the command pending")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked turn was never woken: the finished-download race left it parked forever")
+	}
+}
