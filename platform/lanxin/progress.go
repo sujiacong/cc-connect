@@ -433,16 +433,23 @@ func milestoneLabel(a core.ToolActivity) string {
 		return "📋 正在查询 Jira…"
 	case strings.HasPrefix(a.ToolName, "mcp__wiki-qax__"):
 		return "📚 正在检索知识库文档…"
-	case a.ToolName == "Bash":
+	// qagent 通过 ACP 上报的工具名是 Shell/Process/WriteFile/LoadSkill（不是 Claude 的
+	// Bash/Write/Read），旧白名单与它交集为空，导致卡片链路全程静默跳过（无日志）。
+	case a.ToolName == "Bash" || a.ToolName == "Shell":
 		return "💻 正在执行分析命令…"
 	case a.ToolName == "WebSearch":
 		return "🌐 正在联网检索…"
-	case a.ToolName == "Write" || a.ToolName == "Edit":
+	case a.ToolName == "Write" || a.ToolName == "Edit" || a.ToolName == "WriteFile":
 		return "✍️ 正在整理分析结果…"
 	case a.ToolName == "Read" || a.ToolName == "Grep" || a.ToolName == "Glob":
 		return "🔎 正在检索资料…"
+	case a.ToolName == "Process":
+		return "⏳ 正在等待后台任务…"
+	case a.ToolName == "LoadSkill":
+		return "📚 正在加载技能…"
 	}
-	return ""
+	// 兜底：未知工具也要出进度，否则换 agent 后会再次「静默无卡片」。
+	return "🔎 正在处理…"
 }
 
 // milestoneCardLabel is the short card-header variant of milestoneLabel: the
@@ -454,14 +461,18 @@ func milestoneCardLabel(a core.ToolActivity) string {
 		return "正在查询 Jira…"
 	case strings.HasPrefix(a.ToolName, "mcp__wiki-qax__"):
 		return "正在检索知识库…"
-	case a.ToolName == "Bash":
+	case a.ToolName == "Bash" || a.ToolName == "Shell":
 		return "正在执行分析…"
 	case a.ToolName == "WebSearch":
 		return "正在联网检索…"
-	case a.ToolName == "Write" || a.ToolName == "Edit":
+	case a.ToolName == "Write" || a.ToolName == "Edit" || a.ToolName == "WriteFile":
 		return "正在整理结果…"
 	case a.ToolName == "Read" || a.ToolName == "Grep" || a.ToolName == "Glob":
 		return "正在检索资料…"
+	case a.ToolName == "Process":
+		return "等待后台任务…"
+	case a.ToolName == "LoadSkill":
+		return "加载技能…"
 	}
-	return ""
+	return "正在处理…"
 }
