@@ -154,6 +154,11 @@ func (p *Platform) startCardAfterDelay(key string) {
 func (p *Platform) OnToolActivity(ctx context.Context, replyCtx any, activity core.ToolActivity) error {
 	rc, ok := replyCtx.(replyContext)
 	if !ok || rc.target == "" || !p.milestonesEnabled {
+		// 早退曾完全静默，卡片不出现时无从判断是哪一项不满足；保留一条
+		// debug 作为可复用的判据（enabled=false → 配置未生效；reply_ctx_ok=false →
+		// 引擎传了非 lanxin replyContext）。
+		slog.Debug("lanxin: milestone skipped",
+			"reply_ctx_ok", ok, "target", rc.target, "enabled", p.milestonesEnabled)
 		return nil
 	}
 	key := rc.chatType + ":" + rc.target
@@ -318,6 +323,7 @@ func (p *Platform) drainCardOps(key string, ts *milestoneState) {
 				slog.Debug("lanxin: progress card create failed", "target", key, "error", err)
 				continue
 			}
+			slog.Debug("lanxin: progress card created", "target", key, "msg_id", id)
 		case "update":
 			if cardID == "" {
 				continue

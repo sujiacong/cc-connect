@@ -233,6 +233,9 @@ func New(opts map[string]any) (core.Platform, error) {
 		transferTimeout = time.Duration(v) * time.Minute
 	}
 
+	// 启动时把进度卡开关打出来：卡片不出现时第一件事就是确认这里是否为 true/card。
+	slog.Info("lanxin: milestones configured", "enabled", milestones, "style", milestonesStyle)
+
 	return &Platform{
 		appID:       appID,
 		appSecret:   appSecret,
